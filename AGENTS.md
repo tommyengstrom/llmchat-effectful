@@ -3,6 +3,8 @@ ai-rake is a library for supplier agnostic llms calls with automatic tool call h
 ## Workflow
 
 - `process-compose` is the expected local build/test/ghcid interface.
+- Assume `process-compose` is already running outside of the agent process; use
+  the configured `process-compose process ...` commands against that manager.
 - Do not run `cabal build` / `cabal test` directly; use the configured
   `process-compose` processes instead.
 - The output from ghcid is continuously written to `ghcid.log`; read it to get

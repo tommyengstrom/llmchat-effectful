@@ -1,11 +1,12 @@
 module Rake.TypesSpec where
 
-import Control.Lens ((?~))
 import Data.Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KM
 import Data.OpenApi
+import Data.OpenApi.Optics ()
 import Data.UUID qualified as UUID
+import Optics.Core ((?~))
 import Rake
 import Relude
 import StructuredSchemaTestTypes
@@ -26,8 +27,8 @@ instance ToSchema OpenMapPayload where
         pure $
             NamedSchema (Just "OpenMapPayload") $
                 mempty
-                    & type_ ?~ OpenApiObject
-                    & additionalProperties ?~ AdditionalPropertiesAllowed True
+                    & #type ?~ OpenApiObject
+                    & #additionalProperties ?~ AdditionalPropertiesAllowed True
 
 spec :: Spec
 spec = describe "Rake.Types" $ do

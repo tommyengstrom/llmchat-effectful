@@ -9,7 +9,6 @@ import Data.Aeson.Key (fromText)
 import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Text qualified as AesonText
 import Data.ByteString.Lazy qualified as LBS
-import Data.Generics.Labels ()
 import Data.Text qualified as T
 import Data.Text.Encoding qualified as TextEncoding
 import Data.Text.Lazy qualified as TL
