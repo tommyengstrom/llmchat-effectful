@@ -1,0 +1,39 @@
+version: "0.5"
+
+# Run from the repo root with: nix develop -c process-compose up
+processes:
+  backend-1-cabal-update:
+    command: cabal update
+    availability:
+      restart: "no"
+
+  backend-2-cabal-build-all-deps:
+    command: cabal build all --only-dependencies -O0
+    availability:
+      restart: "no"
+    depends_on:
+      backend-1-cabal-update:
+        condition: process_completed_successfully
+
+  backend-3-cabal-build-all:
+    command: cabal build all -O0
+    availability:
+      restart: "no"
+    depends_on:
+      backend-2-cabal-build-all-deps:
+        condition: process_completed_successfully
+
+  backend-4-cabal-test-all:
+    command: cabal test all -O0
+    availability:
+      restart: "no"
+    depends_on:
+      backend-3-cabal-build-all:
+        condition: process_completed_successfully
+
+  backend-5-ghcid:
+    command: ./run-ghcid.sh
+    is_tty: true
+    depends_on:
+      backend-3-cabal-build-all:
+        condition: process_completed_successfully

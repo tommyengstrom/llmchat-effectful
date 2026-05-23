@@ -46,8 +46,13 @@
             pkgs.hlint
             pkgs.libpq
             pkgs.postgresql
+            pkgs.process-compose
             pkgs.zlib
           ];
+
+          shellHook = ''
+            export PC_PORT_NUM=6599
+          '';
         };
       });
 }
