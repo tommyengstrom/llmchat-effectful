@@ -105,6 +105,7 @@ library
       Rake.TTS
       Rake.Providers.Gemini.Chat
       Rake.Providers.Gemini.Images
+      Rake.Providers.Gemini.Videos
       Rake.PostgresLogger
       Rake.Providers.OpenAI.Chat
       Rake.Providers.OpenAI.Images
@@ -145,6 +146,7 @@ test-suite ai-rake-test
   main-is: Main.hs
   other-modules:
       RakeCliSupport
+      RakeCliSupportSpec
       RakeImageCLI
       RakeImageCLISpec
       RakeTTSCLI

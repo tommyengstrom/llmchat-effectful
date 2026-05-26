@@ -158,6 +158,7 @@ import Effectful.Error.Static
 import Rake
 import Rake.Error (renderRakeError)
 import Rake.Providers.Gemini.Images
+import Rake.Providers.Gemini.Videos
 import Rake.Providers.OpenAI.Images
 import Rake.Providers.XAI.Imagine
 import Relude
@@ -188,9 +189,17 @@ main = do
                 "Animate this still into a gentle dusk timelapse"
             ){imageUrl = Just "https://example.com/still.png", duration = Just 8}
 
+        veoVideo <-
+          generateGeminiVideo
+            (defaultGeminiVideoSettings geminiKey)
+            ( defaultGeminiVideoRequest
+                "A cinematic shot of a ghostly swing moving from the first frame to the last"
+            )
+
         print geminiImage
         print openAiImage
         print xaiVideo
+        print veoVideo
 ```
 
 Validation notes:
@@ -199,6 +208,7 @@ Validation notes:
 - OpenAI `gpt-image-2` does not support transparent backgrounds or explicit `inputFidelity`.
 - xAI `videoUrl` requests are edit operations and cannot be combined with `duration`, `aspectRatio`, or `resolution`.
 - xAI video requests may set `imageUrl` or `videoUrl`, but not both.
+- Gemini Veo `image` requests animate one still image as the first frame; `lastFrame` must also set `image` and is only for first-frame/last-frame interpolation.
 
 ## Text To Speech
 
@@ -254,6 +264,8 @@ Build and run the video CLI with:
 ```bash
 cabal run rake-video -- xai "She walk away" --image girl.jpg
 cabal run rake-video -- xai --extend clip.mp4 "continue the scene for 5 more seconds"
+cabal run rake-video -- veo --image still.png "animate this still frame"
+cabal run rake-video -- veo --image start.png --last-frame end.png "transition between these frames"
 ```
 
 Build and run the speech CLI with:
@@ -269,6 +281,7 @@ Defaults:
 - `rake-image xai ...` uses xAI Grok Imagine image generation
 - `rake-image banana2 ...` uses Gemini `gemini-2.5-flash-image`
 - `rake-video xai ...` uses xAI Grok Imagine video generation
+- `rake-video veo ...` uses Google Veo with default model `veo-3.1-generate-preview`
 - `rake-tts openai ...` uses OpenAI TTS with default model `gpt-4o-mini-tts`
 - `rake-tts xai ...` uses xAI TTS with default voice `eve`
 - No `--output` writes to `./generated/<timestamp>-<slug>.png` for images
@@ -277,7 +290,7 @@ Defaults:
 - `rake-tts --output PATH ...` saves speech to `PATH` instead of playing it
 - `rake-video --extend ...` performs a true append by extracting the last frame locally, generating a continuation from that frame, and concatenating the clips; it requires local `ffmpeg` and `ffprobe`
 
-The CLIs read `OPENAI_API_KEY` for `gptimage` and `rake-tts openai`, `XAI_API_KEY` for `rake-image xai`, `rake-video xai`, and `rake-tts xai`, and `GEMINI_API_KEY` for `banana2`.
+The CLIs read `OPENAI_API_KEY` for `gptimage` and `rake-tts openai`, `XAI_API_KEY` for `rake-image xai`, `rake-video xai`, and `rake-tts xai`, and `GEMINI_API_KEY` for `banana2` and `rake-video veo`.
 
 Use provider-specific help to see all available controls:
 
@@ -288,6 +301,7 @@ cabal run rake-image -- xai --help
 cabal run rake-image -- banana2 --help
 cabal run rake-video -- --help
 cabal run rake-video -- xai --help
+cabal run rake-video -- veo --help
 cabal run rake-tts -- --help
 cabal run rake-tts -- openai --help
 cabal run rake-tts -- xai --help

@@ -6,6 +6,7 @@ import Effectful.Error.Static
 import Rake.Error (RakeError (..))
 import Rake.Media
 import Rake.Providers.Gemini.Images
+import Rake.Providers.Gemini.Videos
 import Rake.Providers.OpenAI.Images
 import Rake.Providers.OpenAI.TTS
 import Rake.Providers.XAI.Imagine
@@ -197,6 +198,92 @@ spec = describe "media providers" $ do
 
         it "encodes failed video statuses" $ do
             toJSON XAIVideoFailed `shouldBe` String "failed"
+
+    describe "Gemini Veo video parsing" $ do
+        it "parses pending video operations" $ do
+            fromJSON
+                ( object
+                    [ "name" .= ("models/veo-3.1-generate-preview/operations/op-1" :: Text)
+                    ]
+                )
+                `shouldBe` Success
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = False
+                        , response = Nothing
+                        , error = Nothing
+                        }
+
+        it "parses completed video operations" $ do
+            let responseValue =
+                    object
+                        [ "name" .= ("models/veo-3.1-generate-preview/operations/op-1" :: Text)
+                        , "done" .= True
+                        , "response"
+                            .= object
+                                [ "generateVideoResponse"
+                                    .= object
+                                        [ "generatedSamples"
+                                            .= ( [ object
+                                                    [ "video"
+                                                        .= object
+                                                            [ "uri" .= ("https://example.com/video.mp4" :: Text)
+                                                            , "mimeType" .= ("video/mp4" :: Text)
+                                                            ]
+                                                    ]
+                                                 ]
+                                                    :: [Value]
+                                               )
+                                        ]
+                                ]
+                        ]
+
+            fromJSON responseValue
+                `shouldBe` Success
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = True
+                        , response =
+                            Just
+                                GeminiGenerateVideoResponse
+                                    { generatedVideos =
+                                        [ GeminiGeneratedVideo
+                                            { uri = Just "https://example.com/video.mp4"
+                                            , mimeType = Just "video/mp4"
+                                            , videoBytes = Nothing
+                                            }
+                                        ]
+                                    }
+                        , error = Nothing
+                        }
+
+        it "parses failed video operations" $ do
+            let responseValue =
+                    object
+                        [ "name" .= ("models/veo-3.1-generate-preview/operations/op-1" :: Text)
+                        , "done" .= True
+                        , "error"
+                            .= object
+                                [ "code" .= (400 :: Int)
+                                , "message" .= ("blocked" :: Text)
+                                , "status" .= ("FAILED_PRECONDITION" :: Text)
+                                ]
+                        ]
+
+            fromJSON responseValue
+                `shouldBe` Success
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = True
+                        , response = Nothing
+                        , error =
+                            Just
+                                GeminiVideoError
+                                    { code = Just 400
+                                    , message = Just "blocked"
+                                    , status = Just "FAILED_PRECONDITION"
+                                    }
+                        }
 
     describe "request encoding" $ do
         it "encodes default OpenAI image requests for gpt-image-2" $ do
@@ -441,6 +528,60 @@ spec = describe "media providers" $ do
                             ]
                     ]
 
+        it "encodes Gemini Veo first and last frame requests" $ do
+            let request :: GeminiVideoRequest
+                request =
+                    GeminiVideoRequest
+                        { model = "veo-3.1-generate-preview"
+                        , prompt = "move between these frames"
+                        , image =
+                            Just
+                                GeminiInlineImage
+                                    { mimeType = "image/png"
+                                    , base64Data = "Zmlyc3Q="
+                                    }
+                        , lastFrame =
+                            Just
+                                GeminiInlineImage
+                                    { mimeType = "image/png"
+                                    , base64Data = "bGFzdA=="
+                                    }
+                        , durationSeconds = Just 8
+                        , aspectRatio = Just "16:9"
+                        , resolution = Just "720p"
+                        , personGeneration = Just "allow_adult"
+                        , seed = Just 123
+                        }
+
+            toJSON request
+                `shouldBe` object
+                    [ "instances"
+                        .= ( [ object
+                                [ "prompt" .= ("move between these frames" :: Text)
+                                , "image"
+                                    .= object
+                                        [ "bytesBase64Encoded" .= ("Zmlyc3Q=" :: Text)
+                                        , "mimeType" .= ("image/png" :: Text)
+                                        ]
+                                , "lastFrame"
+                                    .= object
+                                        [ "bytesBase64Encoded" .= ("bGFzdA==" :: Text)
+                                        , "mimeType" .= ("image/png" :: Text)
+                                        ]
+                                ]
+                             ]
+                                :: [Value]
+                           )
+                    , "parameters"
+                        .= object
+                            [ "durationSeconds" .= (8 :: Int)
+                            , "aspectRatio" .= ("16:9" :: Text)
+                            , "resolution" .= ("720p" :: Text)
+                            , "personGeneration" .= ("allow_adult" :: Text)
+                            , "seed" .= (123 :: Int)
+                            ]
+                    ]
+
         it "encodes xAI text-to-video requests" $ do
             let request :: XAIImagineVideoRequest
                 request =
@@ -618,6 +759,47 @@ spec = describe "media providers" $ do
 
             result
                 `shouldBe` Left (LlmExpectationError "xAI video requests cannot set both imageUrl and videoUrl")
+
+        it "fails fast on Gemini Veo lastFrame without image" $ do
+            let request =
+                    (defaultGeminiVideoRequest "move between frames")
+                        { lastFrame =
+                            Just
+                                GeminiInlineImage
+                                    { mimeType = "image/png"
+                                    , base64Data = "bGFzdA=="
+                                    }
+                        }
+
+            result <-
+                runLlmError
+                    $ startGeminiVideo (defaultGeminiVideoSettings "test-key") request
+
+            result
+                `shouldBe` Left (LlmExpectationError "Gemini Veo lastFrame requires image")
+
+        it "fails fast on Gemini Veo first and last frame requests with a non-8 duration" $ do
+            let inlineImage =
+                    GeminiInlineImage
+                        { mimeType = "image/png"
+                        , base64Data = "Zmlyc3Q="
+                        }
+                request =
+                    (defaultGeminiVideoRequest "move between frames")
+                        { image = Just inlineImage
+                        , lastFrame = Just inlineImage
+                        , durationSeconds = Just 4
+                        }
+
+            result <-
+                runLlmError
+                    $ startGeminiVideo (defaultGeminiVideoSettings "test-key") request
+
+            result
+                `shouldBe` Left
+                    ( LlmExpectationError
+                        "Gemini Veo first/last frame interpolation requires durationSeconds=8"
+                    )
 
 runLlmError :: Eff '[Error RakeError, IOE] a -> IO (Either RakeError a)
 runLlmError =

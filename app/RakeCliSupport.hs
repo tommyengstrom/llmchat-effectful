@@ -1,8 +1,12 @@
 module RakeCliSupport
-    ( audioExtensionFromMimeType
+    ( ImageDimensions (..)
+    , ResolvedInlineImageSource (..)
+    , audioExtensionFromMimeType
     , buildOutputPaths
     , downloadBinary
+    , imageDimensionsFromBytes
     , resolveInlineImageSource
+    , resolveInlineImageSourceWithMetadata
     , resolveMediaSource
     , slugifyPromptWithFallback
     , urlExtension
@@ -10,6 +14,7 @@ module RakeCliSupport
     ) where
 
 import Control.Exception (try)
+import Data.Bits (shiftL)
 import Data.ByteString qualified as BS
 import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LBS
@@ -23,6 +28,18 @@ import Rake.Providers.Gemini.Images (GeminiInlineImage (..))
 import Relude
 import System.Directory
 import System.FilePath
+
+data ImageDimensions = ImageDimensions
+    { imageWidth :: Int
+    , imageHeight :: Int
+    }
+    deriving stock (Show, Eq)
+
+data ResolvedInlineImageSource = ResolvedInlineImageSource
+    { inlineImage :: GeminiInlineImage
+    , imageDimensions :: Maybe ImageDimensions
+    }
+    deriving stock (Show, Eq)
 
 slugifyPromptWithFallback :: FilePath -> Text -> FilePath
 slugifyPromptWithFallback fallback promptText =
@@ -64,7 +81,15 @@ resolveMediaSource source
             else pure (Left ("Source is not a URL, data URL, or existing file: " <> source))
 
 resolveInlineImageSource :: Text -> IO (Either Text GeminiInlineImage)
-resolveInlineImageSource source
+resolveInlineImageSource source =
+    fmap
+        ( \ResolvedInlineImageSource{inlineImage} ->
+            inlineImage
+        )
+        <$> resolveInlineImageSourceWithMetadata source
+
+resolveInlineImageSourceWithMetadata :: Text -> IO (Either Text ResolvedInlineImageSource)
+resolveInlineImageSourceWithMetadata source
     | "data:" `T.isPrefixOf` source =
         pure (decodeDataUrl source)
     | isRemoteUrl source = do
@@ -76,7 +101,7 @@ resolveInlineImageSource source
                     (Left ("Could not determine a MIME type for source URL: " <> source))
                     Right
                     (detectImageMimeType sourceBytes <|> mimeTypeFromPath (toString source))
-            pure (inlineImageFromBytes mimeType sourceBytes)
+            pure (inlineImageFromBytesWithMetadata mimeType sourceBytes)
     | otherwise = do
         let path = toString source
         exists <- doesFileExist path
@@ -89,7 +114,7 @@ resolveInlineImageSource source
                             (Left ("Could not determine a MIME type for source file: " <> source))
                             Right
                             (detectImageMimeType sourceBytes <|> mimeTypeFromPath path)
-                    pure (inlineImageFromBytes mimeType sourceBytes)
+                    pure (inlineImageFromBytesWithMetadata mimeType sourceBytes)
             else pure (Left ("Source is not a URL, data URL, or existing file: " <> source))
 
 downloadBinary :: Text -> IO (Either Text BS.ByteString)
@@ -172,7 +197,7 @@ renderDataUrl mimeType sourceBytes =
         <> ";base64,"
         <> TextEncoding.decodeUtf8 (Base64.encode sourceBytes)
 
-decodeDataUrl :: Text -> Either Text GeminiInlineImage
+decodeDataUrl :: Text -> Either Text ResolvedInlineImageSource
 decodeDataUrl source = do
     header <- maybe (Left ("Invalid data URL: " <> source)) Right (T.stripPrefix "data:" rawHeader)
     let (mimeType, parameters) = splitDataUrlHeader header
@@ -186,7 +211,7 @@ decodeDataUrl source = do
         first
             (("Failed to decode base64 data URL: " <>) . toText)
             (Base64.decode (TextEncoding.encodeUtf8 encodedPayload))
-    pure (inlineImageFromBytes mimeType decodedBytes)
+    pure (inlineImageFromBytesWithMetadata mimeType decodedBytes)
   where
     (rawHeader, payloadWithComma) = T.breakOn "," source
     encodedPayload = T.drop 1 payloadWithComma
@@ -199,12 +224,156 @@ splitDataUrlHeader header =
         mimeType : parameters ->
             (mimeType, parameters)
 
+inlineImageFromBytesWithMetadata :: Text -> BS.ByteString -> ResolvedInlineImageSource
+inlineImageFromBytesWithMetadata mimeType sourceBytes =
+    ResolvedInlineImageSource
+        { inlineImage = inlineImageFromBytes mimeType sourceBytes
+        , imageDimensions = imageDimensionsFromBytes sourceBytes
+        }
+
 inlineImageFromBytes :: Text -> BS.ByteString -> GeminiInlineImage
 inlineImageFromBytes mimeType sourceBytes =
     GeminiInlineImage
         { mimeType
         , base64Data = TextEncoding.decodeUtf8 (Base64.encode sourceBytes)
         }
+
+imageDimensionsFromBytes :: BS.ByteString -> Maybe ImageDimensions
+imageDimensionsFromBytes bytes =
+    pngDimensions bytes <|> jpegDimensions bytes <|> gifDimensions bytes
+
+pngDimensions :: BS.ByteString -> Maybe ImageDimensions
+pngDimensions bytes
+    | pngSignature `BS.isPrefixOf` bytes && BS.length bytes >= 24 =
+        Just
+            ImageDimensions
+                { imageWidth = readWord32BE bytes 16
+                , imageHeight = readWord32BE bytes 20
+                }
+    | otherwise =
+        Nothing
+  where
+    pngSignature = BS.pack [137, 80, 78, 71, 13, 10, 26, 10]
+
+jpegDimensions :: BS.ByteString -> Maybe ImageDimensions
+jpegDimensions bytes
+    | BS.pack [255, 216] `BS.isPrefixOf` bytes =
+        go 2
+    | otherwise =
+        Nothing
+  where
+    byteLength = BS.length bytes
+
+    go offset = do
+        markerStart <- nextMarkerStart offset
+        marker <- byteAt (markerStart + 1)
+        parseMarker markerStart marker
+
+    parseMarker markerStart marker
+        | isStandaloneMarker marker =
+            go (markerStart + 2)
+        | isStartOfFrameMarker marker = do
+            segmentLength <- word16At (markerStart + 2)
+            guard (segmentLength >= 7)
+            guard (markerStart + 8 < byteLength)
+            Just
+                ImageDimensions
+                    { imageWidth = readWord16BE bytes (markerStart + 7)
+                    , imageHeight = readWord16BE bytes (markerStart + 5)
+                    }
+        | marker == 0xDA || marker == 0xD9 =
+            Nothing
+        | otherwise = do
+            segmentLength <- word16At (markerStart + 2)
+            guard (segmentLength >= 2)
+            go (markerStart + 2 + segmentLength)
+
+    nextMarkerStart offset
+        | offset + 1 >= byteLength =
+            Nothing
+        | byteAt offset /= Just 0xFF =
+            nextMarkerStart (offset + 1)
+        | otherwise =
+            case skipFillBytes (offset + 1) of
+                markerOffset
+                    | markerOffset >= byteLength ->
+                        Nothing
+                    | byteAt markerOffset == Just 0x00 ->
+                        nextMarkerStart (markerOffset + 1)
+                    | otherwise ->
+                        Just (markerOffset - 1)
+
+    skipFillBytes offset
+        | byteAt offset == Just 0xFF =
+            skipFillBytes (offset + 1)
+        | otherwise =
+            offset
+
+    byteAt offset
+        | offset >= 0 && offset < byteLength =
+            Just (BS.index bytes offset)
+        | otherwise =
+            Nothing
+
+    word16At offset
+        | offset + 1 < byteLength =
+            Just (readWord16BE bytes offset)
+        | otherwise =
+            Nothing
+
+    isStandaloneMarker marker =
+        marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)
+
+    isStartOfFrameMarker = \case
+        0xC0 -> True
+        0xC1 -> True
+        0xC2 -> True
+        0xC3 -> True
+        0xC5 -> True
+        0xC6 -> True
+        0xC7 -> True
+        0xC9 -> True
+        0xCA -> True
+        0xCB -> True
+        0xCD -> True
+        0xCE -> True
+        0xCF -> True
+        _ -> False
+
+gifDimensions :: BS.ByteString -> Maybe ImageDimensions
+gifDimensions bytes
+    | (gif87aSignature `BS.isPrefixOf` bytes || gif89aSignature `BS.isPrefixOf` bytes)
+        && BS.length bytes >= 10 =
+        Just
+            ImageDimensions
+                { imageWidth = readWord16LE bytes 6
+                , imageHeight = readWord16LE bytes 8
+                }
+    | otherwise =
+        Nothing
+  where
+    gif87aSignature = TextEncoding.encodeUtf8 "GIF87a"
+    gif89aSignature = TextEncoding.encodeUtf8 "GIF89a"
+
+readWord32BE :: BS.ByteString -> Int -> Int
+readWord32BE bytes offset =
+    shiftByte offset 24
+        + shiftByte (offset + 1) 16
+        + shiftByte (offset + 2) 8
+        + shiftByte (offset + 3) 0
+  where
+    shiftByte byteOffset bitCount =
+        fromIntegral (BS.index bytes byteOffset) `shiftL` bitCount
+
+readWord16BE :: BS.ByteString -> Int -> Int
+readWord16BE bytes offset =
+    (fromIntegral (BS.index bytes offset) `shiftL` 8)
+        + fromIntegral (BS.index bytes (offset + 1))
+
+readWord16LE :: BS.ByteString -> Int -> Int
+readWord16LE bytes offset =
+    fromIntegral (BS.index bytes offset)
+        + (fromIntegral (BS.index bytes (offset + 1)) `shiftL` 8)
 
 requestedPathTemplates :: FilePath -> Int -> [FilePath]
 requestedPathTemplates requestedPath assetTotal

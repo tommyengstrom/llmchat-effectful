@@ -3,11 +3,13 @@ module RakeVideoCLI
     , GenVideoHelpTopic (..)
     , CommonGenVideoOptions (..)
     , XAIGenVideoOptions (..)
+    , VeoGenVideoOptions (..)
     , GenVideoOptions (..)
     , ParseGenVideoArgsResult (..)
     , parseGenVideoArgs
     , renderGenVideoHelp
     , runGenVideoCli
+    , veoAspectRatioForImageDimensions
     ) where
 
 import Data.ByteString qualified as BS
@@ -16,6 +18,7 @@ import Effectful.Error.Static
 import RakeCliSupport
 import Data.Text qualified as T
 import Rake
+import Rake.Providers.Gemini.Videos
 import Rake.Providers.XAI.Imagine
 import Relude hiding (exitFailure, getArgs, lookupEnv)
 import System.Directory
@@ -26,11 +29,13 @@ import System.Process (readProcessWithExitCode)
 
 data GenVideoProvider
     = GenVideoProviderXAI
+    | GenVideoProviderVeo
     deriving stock (Show, Eq)
 
 data GenVideoHelpTopic
     = GenVideoHelpGeneral
     | GenVideoHelpXAI
+    | GenVideoHelpVeo
     deriving stock (Show, Eq)
 
 data CommonGenVideoOptions = CommonGenVideoOptions
@@ -53,8 +58,24 @@ data XAIGenVideoOptions = XAIGenVideoOptions
     }
     deriving stock (Show, Eq)
 
+data VeoGenVideoOptions = VeoGenVideoOptions
+    { veoVideoCommonOptions :: CommonGenVideoOptions
+    , veoVideoModel :: Text
+    , veoVideoImageSource :: Maybe Text
+    , veoVideoLastFrameSource :: Maybe Text
+    , veoVideoDuration :: Maybe Int
+    , veoVideoAspectRatio :: Maybe Text
+    , veoVideoResolution :: Maybe Text
+    , veoVideoPersonGeneration :: Maybe Text
+    , veoVideoSeed :: Maybe Int
+    , veoVideoPollIntervalMilliseconds :: Int
+    , veoVideoMaxPollAttempts :: Int
+    }
+    deriving stock (Show, Eq)
+
 data GenVideoOptions
     = GenVideoXAI XAIGenVideoOptions
+    | GenVideoVeo VeoGenVideoOptions
     deriving stock (Show, Eq)
 
 data ParseGenVideoArgsResult
@@ -92,6 +113,26 @@ defaultXAIGenVideoOptions =
         , xaiVideoResolution = Nothing
         , xaiVideoPollIntervalMilliseconds = 5000
         , xaiVideoMaxPollAttempts = 120
+        }
+
+defaultVeoGenVideoOptions :: VeoGenVideoOptions
+defaultVeoGenVideoOptions =
+    VeoGenVideoOptions
+        { veoVideoCommonOptions =
+            CommonGenVideoOptions
+                { commonVideoPromptText = ""
+                , commonVideoOutputPath = Nothing
+                }
+        , veoVideoModel = "veo-3.1-generate-preview"
+        , veoVideoImageSource = Nothing
+        , veoVideoLastFrameSource = Nothing
+        , veoVideoDuration = Nothing
+        , veoVideoAspectRatio = Nothing
+        , veoVideoResolution = Nothing
+        , veoVideoPersonGeneration = Nothing
+        , veoVideoSeed = Nothing
+        , veoVideoPollIntervalMilliseconds = 5000
+        , veoVideoMaxPollAttempts = 120
         }
 
 runGenVideoCli :: IO ()
@@ -207,16 +248,98 @@ runGenVideo = \case
                                         xaiVideoResolution
                                 _ ->
                                     pure (Left "Use at most one of --image, --edit/--video, or --extend.")
+    GenVideoVeo VeoGenVideoOptions
+        { veoVideoCommonOptions = CommonGenVideoOptions{commonVideoPromptText, commonVideoOutputPath}
+        , veoVideoModel
+        , veoVideoImageSource
+        , veoVideoLastFrameSource
+        , veoVideoDuration
+        , veoVideoAspectRatio
+        , veoVideoResolution
+        , veoVideoPersonGeneration
+        , veoVideoSeed
+        , veoVideoPollIntervalMilliseconds
+        , veoVideoMaxPollAttempts
+        } -> do
+            maybeApiKey <- lookupEnv "GEMINI_API_KEY"
+            case maybeApiKey of
+                Nothing ->
+                    pure (Left "GEMINI_API_KEY is required for Veo video generation")
+                Just apiKey -> do
+                    resolvedImageSource <- traverse resolveInlineImageSourceWithMetadata veoVideoImageSource
+                    resolvedLastFrameSource <- traverse resolveInlineImageSource veoVideoLastFrameSource
+                    case (sequence resolvedImageSource, sequence resolvedLastFrameSource) of
+                        (Left err, _) ->
+                            pure (Left err)
+                        (_, Left err) ->
+                            pure (Left err)
+                        (Right maybeImageSource, Right maybeLastFrameSource) -> do
+                            let settings =
+                                    veoSettings
+                                        (toText apiKey)
+                                        veoVideoPollIntervalMilliseconds
+                                        veoVideoMaxPollAttempts
+                                maybeInlineImageSource =
+                                    ( \ResolvedInlineImageSource{inlineImage} ->
+                                        inlineImage
+                                    )
+                                        <$> maybeImageSource
+                                inferredAspectRatio = do
+                                    ResolvedInlineImageSource{imageDimensions} <- maybeImageSource
+                                    veoAspectRatioForImageDimensions <$> imageDimensions
+                                effectiveAspectRatio =
+                                    veoVideoAspectRatio <|> inferredAspectRatio
+                                request :: GeminiVideoRequest
+                                request =
+                                    GeminiVideoRequest
+                                        { model = veoVideoModel
+                                        , prompt = commonVideoPromptText
+                                        , image = maybeInlineImageSource
+                                        , lastFrame = maybeLastFrameSource
+                                        , durationSeconds = veoVideoDuration
+                                        , aspectRatio = effectiveAspectRatio
+                                        , resolution = veoVideoResolution
+                                        , personGeneration = veoVideoPersonGeneration
+                                        , seed = veoVideoSeed
+                                        }
+                            responseResult <- runProvider (generateGeminiVideo settings request)
+                            handleGeminiVideoResponse settings commonVideoOutputPath commonVideoPromptText responseResult
   where
+    videoSettings :: Text -> Int -> Int -> XAIImagineSettings '[Error RakeError, IOE]
     videoSettings apiKey pollIntervalMilliseconds' maxPollAttempts' =
-        (defaultXAIImagineSettings apiKey)
-            { pollIntervalMilliseconds = pollIntervalMilliseconds'
-            , maxPollAttempts = maxPollAttempts'
-            }
+        case defaultXAIImagineSettings apiKey of
+            XAIImagineSettings
+                { apiKey = settingsApiKey
+                , baseUrl = settingsBaseUrl
+                , requestLogger = settingsRequestLogger
+                } ->
+                    XAIImagineSettings
+                        { apiKey = settingsApiKey
+                        , baseUrl = settingsBaseUrl
+                        , pollIntervalMilliseconds = pollIntervalMilliseconds'
+                        , maxPollAttempts = maxPollAttempts'
+                        , requestLogger = settingsRequestLogger
+                        }
+
+    veoSettings :: Text -> Int -> Int -> GeminiVideoSettings '[Error RakeError, IOE]
+    veoSettings apiKey pollIntervalMilliseconds' maxPollAttempts' =
+        case defaultGeminiVideoSettings apiKey of
+            GeminiVideoSettings
+                { apiKey = settingsApiKey
+                , baseUrl = settingsBaseUrl
+                , requestLogger = settingsRequestLogger
+                } ->
+                    GeminiVideoSettings
+                        { apiKey = settingsApiKey
+                        , baseUrl = settingsBaseUrl
+                        , pollIntervalMilliseconds = pollIntervalMilliseconds'
+                        , maxPollAttempts = maxPollAttempts'
+                        , requestLogger = settingsRequestLogger
+                        }
 
     runProvider
-        :: Eff '[Error RakeError, IOE] XAIVideoResponse
-        -> IO (Either Text XAIVideoResponse)
+        :: Eff '[Error RakeError, IOE] a
+        -> IO (Either Text a)
     runProvider action = do
         result <-
             runEff
@@ -232,6 +355,28 @@ runGenVideo = \case
                 saveGeneratedVideo maybeOutput promptText generatedVideo
             Right XAIVideoResponse{status} ->
                 pure (Left ("The provider did not return a completed video. Final status: " <> renderVideoStatus status))
+
+    handleGeminiVideoResponse settings maybeOutput promptText responseResult =
+        case responseResult of
+            Left err ->
+                pure (Left err)
+            Right GeminiVideoOperation{error = Just videoError} ->
+                pure (Left ("Gemini Veo video generation failed: " <> renderGeminiVideoError videoError))
+            Right GeminiVideoOperation{response = Just GeminiGenerateVideoResponse{generatedVideos = generatedVideo : _}} ->
+                saveGeminiGeneratedVideo settings maybeOutput promptText generatedVideo
+            Right GeminiVideoOperation{done} ->
+                pure (Left ("The provider did not return a completed Veo video operation. done=" <> show done))
+
+    saveGeminiGeneratedVideo settings maybeOutput promptText generatedVideo@GeminiGeneratedVideo{uri = maybeVideoUri} = do
+        traverse_ (\videoUri -> putTextLn ("Provider video URI: " <> videoUri)) maybeVideoUri
+        downloadResult <- runProvider (downloadGeminiVideo settings generatedVideo)
+        case downloadResult of
+            Left err ->
+                pure (Left err)
+            Right videoBytes -> do
+                outputPaths <- buildOutputPaths "video" maybeOutput promptText [".mp4"]
+                traverse_ (`writeBinaryFile` videoBytes) outputPaths
+                pure (Right outputPaths)
 
     extendVideoFromEnd apiKey pollIntervalMilliseconds' maxPollAttempts' modelName promptText maybeOutput sourceVideo duration aspectRatio resolution = do
         ffmpegPathResult <- requireExecutable "ffmpeg"
@@ -301,25 +446,36 @@ runGenVideo = \case
                                                 Right XAIVideoResponse{status} ->
                                                     pure (Left ("The provider did not return a completed continuation video. Final status: " <> renderVideoStatus status))
 
+veoAspectRatioForImageDimensions :: ImageDimensions -> Text
+veoAspectRatioForImageDimensions ImageDimensions{imageWidth, imageHeight}
+    | imageWidth < imageHeight =
+        "9:16"
+    | otherwise =
+        "16:9"
+
 parseGenVideoArgs :: [Text] -> ParseGenVideoArgsResult
 parseGenVideoArgs = \case
     [] ->
-        ParseGenVideoArgsError "A provider is required. Use `xai`." GenVideoHelpGeneral
+        ParseGenVideoArgsError "A provider is required. Use `xai` or `veo`." GenVideoHelpGeneral
     "--help" : _ ->
         ParseGenVideoArgsHelp GenVideoHelpGeneral
     providerArg : rest ->
         case parseProvider providerArg of
             Nothing ->
                 ParseGenVideoArgsError
-                    ("Unknown provider: " <> providerArg <> ". Use `xai`.")
+                    ("Unknown provider: " <> providerArg <> ". Use `xai` or `veo`.")
                     GenVideoHelpGeneral
             Just GenVideoProviderXAI ->
                 parseXAIArgs rest
+            Just GenVideoProviderVeo ->
+                parseVeoArgs rest
 
 parseProvider :: Text -> Maybe GenVideoProvider
 parseProvider = \case
     "xai" ->
         Just GenVideoProviderXAI
+    "veo" ->
+        Just GenVideoProviderVeo
     _ ->
         Nothing
 
@@ -428,6 +584,121 @@ parseXAIArgs =
                                 }
                         }
 
+parseVeoArgs :: [Text] -> ParseGenVideoArgsResult
+parseVeoArgs =
+    go defaultCommonParseState defaultVeoGenVideoOptions
+  where
+    go commonState veoOptions = \case
+        [] ->
+            finalize commonState veoOptions
+        "--help" : _ ->
+            ParseGenVideoArgsHelp GenVideoHelpVeo
+        "--" : rest ->
+            finalize
+                (appendPromptParts commonState rest)
+                veoOptions
+        "--output" : path : rest ->
+            go commonState{parseOutputPath = Just (toString path)} veoOptions rest
+        "-o" : path : rest ->
+            go commonState{parseOutputPath = Just (toString path)} veoOptions rest
+        "--model" : modelName : rest ->
+            go commonState veoOptions{veoVideoModel = modelName} rest
+        "--image" : imageSource : rest ->
+            go commonState veoOptions{veoVideoImageSource = Just imageSource} rest
+        "--last-frame" : imageSource : rest ->
+            go commonState veoOptions{veoVideoLastFrameSource = Just imageSource} rest
+        "--duration" : rawDuration : rest ->
+            case parsePositiveIntOption "--duration" rawDuration of
+                Left err ->
+                    ParseGenVideoArgsError err GenVideoHelpVeo
+                Right durationSeconds ->
+                    go commonState veoOptions{veoVideoDuration = Just durationSeconds} rest
+        "--aspect-ratio" : aspectRatioValue : rest ->
+            go commonState veoOptions{veoVideoAspectRatio = Just aspectRatioValue} rest
+        "--resolution" : resolutionValue : rest ->
+            go commonState veoOptions{veoVideoResolution = Just resolutionValue} rest
+        "--person-generation" : personGenerationValue : rest ->
+            go commonState veoOptions{veoVideoPersonGeneration = Just personGenerationValue} rest
+        "--seed" : rawSeed : rest ->
+            case parseIntOption "--seed" rawSeed of
+                Left err ->
+                    ParseGenVideoArgsError err GenVideoHelpVeo
+                Right seedValue ->
+                    go commonState veoOptions{veoVideoSeed = Just seedValue} rest
+        "--poll-interval-ms" : rawPollInterval : rest ->
+            case parsePositiveIntOption "--poll-interval-ms" rawPollInterval of
+                Left err ->
+                    ParseGenVideoArgsError err GenVideoHelpVeo
+                Right pollIntervalMilliseconds ->
+                    go commonState veoOptions{veoVideoPollIntervalMilliseconds = pollIntervalMilliseconds} rest
+        "--max-poll-attempts" : rawMaxPollAttempts : rest ->
+            case parsePositiveIntOption "--max-poll-attempts" rawMaxPollAttempts of
+                Left err ->
+                    ParseGenVideoArgsError err GenVideoHelpVeo
+                Right maxPollAttempts ->
+                    go commonState veoOptions{veoVideoMaxPollAttempts = maxPollAttempts} rest
+        arg : rest
+            | Just path <- T.stripPrefix "--output=" arg ->
+                go commonState{parseOutputPath = Just (toString path)} veoOptions rest
+            | Just modelName <- T.stripPrefix "--model=" arg ->
+                go commonState veoOptions{veoVideoModel = modelName} rest
+            | Just imageSource <- T.stripPrefix "--image=" arg ->
+                go commonState veoOptions{veoVideoImageSource = Just imageSource} rest
+            | Just imageSource <- T.stripPrefix "--last-frame=" arg ->
+                go commonState veoOptions{veoVideoLastFrameSource = Just imageSource} rest
+            | Just rawDuration <- T.stripPrefix "--duration=" arg ->
+                case parsePositiveIntOption "--duration" rawDuration of
+                    Left err ->
+                        ParseGenVideoArgsError err GenVideoHelpVeo
+                    Right durationSeconds ->
+                        go commonState veoOptions{veoVideoDuration = Just durationSeconds} rest
+            | Just aspectRatioValue <- T.stripPrefix "--aspect-ratio=" arg ->
+                go commonState veoOptions{veoVideoAspectRatio = Just aspectRatioValue} rest
+            | Just resolutionValue <- T.stripPrefix "--resolution=" arg ->
+                go commonState veoOptions{veoVideoResolution = Just resolutionValue} rest
+            | Just personGenerationValue <- T.stripPrefix "--person-generation=" arg ->
+                go commonState veoOptions{veoVideoPersonGeneration = Just personGenerationValue} rest
+            | Just rawSeed <- T.stripPrefix "--seed=" arg ->
+                case parseIntOption "--seed" rawSeed of
+                    Left err ->
+                        ParseGenVideoArgsError err GenVideoHelpVeo
+                    Right seedValue ->
+                        go commonState veoOptions{veoVideoSeed = Just seedValue} rest
+            | Just rawPollInterval <- T.stripPrefix "--poll-interval-ms=" arg ->
+                case parsePositiveIntOption "--poll-interval-ms" rawPollInterval of
+                    Left err ->
+                        ParseGenVideoArgsError err GenVideoHelpVeo
+                    Right pollIntervalMilliseconds ->
+                        go commonState veoOptions{veoVideoPollIntervalMilliseconds = pollIntervalMilliseconds} rest
+            | Just rawMaxPollAttempts <- T.stripPrefix "--max-poll-attempts=" arg ->
+                case parsePositiveIntOption "--max-poll-attempts" rawMaxPollAttempts of
+                    Left err ->
+                        ParseGenVideoArgsError err GenVideoHelpVeo
+                    Right maxPollAttempts ->
+                        go commonState veoOptions{veoVideoMaxPollAttempts = maxPollAttempts} rest
+            | "-" `T.isPrefixOf` arg ->
+                ParseGenVideoArgsError ("Unknown veo option: " <> arg) GenVideoHelpVeo
+            | otherwise ->
+                go (appendPromptParts commonState [arg]) veoOptions rest
+
+    finalize CommonParseState{parseOutputPath, parsePromptParts} veoOptions
+        | null parsePromptParts =
+            ParseGenVideoArgsError "A prompt is required." GenVideoHelpVeo
+        | hasVeoLastFrameWithoutImage veoOptions =
+            ParseGenVideoArgsError
+                "veo --last-frame is only for first/last frame interpolation and requires --image. To animate one still image, use --image SOURCE."
+                GenVideoHelpVeo
+        | otherwise =
+            ParseGenVideoArgsSuccess $
+                GenVideoVeo
+                    veoOptions
+                        { veoVideoCommonOptions =
+                            CommonGenVideoOptions
+                                { commonVideoPromptText = T.unwords parsePromptParts
+                                , commonVideoOutputPath = parseOutputPath
+                                }
+                        }
+
 parsePositiveIntOption :: Text -> Text -> Either Text Int
 parsePositiveIntOption optionName rawValue =
     case readMaybe @Int (toString rawValue) of
@@ -439,6 +710,14 @@ parsePositiveIntOption optionName rawValue =
             | otherwise ->
                 Right value
 
+parseIntOption :: Text -> Text -> Either Text Int
+parseIntOption optionName rawValue =
+    case readMaybe @Int (toString rawValue) of
+        Nothing ->
+            Left ("Invalid value for " <> optionName <> ": " <> rawValue)
+        Just value ->
+            Right value
+
 appendPromptParts :: CommonParseState -> [Text] -> CommonParseState
 appendPromptParts commonState@CommonParseState{parsePromptParts} extraPromptParts =
     commonState{parsePromptParts = parsePromptParts <> extraPromptParts}
@@ -447,15 +726,21 @@ hasXAIVideoSourceConflict :: XAIGenVideoOptions -> Bool
 hasXAIVideoSourceConflict XAIGenVideoOptions{xaiVideoImageSource, xaiVideoEditSource, xaiVideoExtendSource} =
     length (catMaybes [xaiVideoImageSource, xaiVideoEditSource, xaiVideoExtendSource]) > 1
 
+hasVeoLastFrameWithoutImage :: VeoGenVideoOptions -> Bool
+hasVeoLastFrameWithoutImage VeoGenVideoOptions{veoVideoImageSource, veoVideoLastFrameSource} =
+    isNothing veoVideoImageSource && isJust veoVideoLastFrameSource
+
 renderGenVideoHelp :: String -> GenVideoHelpTopic -> Text
 renderGenVideoHelp progName = \case
     GenVideoHelpGeneral ->
         T.unlines $
             [ "Usage:"
             , "  " <> toText progName <> " xai [OPTIONS] PROMPT"
+            , "  " <> toText progName <> " veo [OPTIONS] PROMPT"
             , ""
             , "Providers:"
             , "  xai     Generate videos with xAI Grok Imagine. Default model: grok-imagine-video"
+            , "  veo     Generate videos with Google Veo. Default model: veo-3.1-generate-preview"
             , ""
             , "Common options:"
             ]
@@ -465,18 +750,24 @@ renderGenVideoHelp progName = \case
                    ]
                 <> xaiOptionLines
                 <> [ ""
+                   , "veo options:"
+                   ]
+                <> veoOptionLines
+                <> [ ""
                    , "Notes:"
                    , "  SOURCE can be a URL, a data URL, or a local file path."
-                   , "  Use `" <> toText progName <> " xai --help` for focused help."
+                   , "  Use `" <> toText progName <> " xai --help` or `" <> toText progName <> " veo --help` for focused help."
                    , "  With no source option, the CLI sends a text-to-video request."
                    , "  Use `--image SOURCE` for image-to-video generation."
+                   , "  Use `veo --image START --last-frame END` for first/last frame interpolation."
                    , "  Use `--edit SOURCE` to update an existing video."
                    , "  Use `--extend SOURCE` to append a continuation to the end of a video."
                    , "  `--video SOURCE` is kept as a compatible alias for `--edit`."
-                   , "  `--duration`, `--aspect-ratio`, and `--resolution` apply to text-to-video, image-to-video, and extend."
+                   , "  `--duration`, `--aspect-ratio`, and `--resolution` apply to text-to-video and image-to-video; xAI also accepts them for extend."
                    , "  `--extend` requires local `ffmpeg` and `ffprobe`."
                    , "  `--extend` currently supports local files and URLs, not data URLs."
                    , "  XAI_API_KEY is required."
+                   , "  GEMINI_API_KEY is required for `veo`."
                    , ""
                    , "Examples:"
                    , "  " <> toText progName <> " xai \"A paper crane unfolds into a bird and flies away\""
@@ -484,6 +775,8 @@ renderGenVideoHelp progName = \case
                    , "  " <> toText progName <> " xai --image=girl.jpg --duration=8 \"She walk away\""
                    , "  " <> toText progName <> " xai --edit=clip.mp4 \"make the lighting moodier\""
                    , "  " <> toText progName <> " xai --extend=clip.mp4 \"continue the scene for 5 more seconds\""
+                   , "  " <> toText progName <> " veo --image=still.png \"animate this still frame\""
+                   , "  " <> toText progName <> " veo --image=start.png --last-frame=end.png \"transition between these frames\""
                    ]
     GenVideoHelpXAI ->
         T.unlines $
@@ -519,6 +812,34 @@ renderGenVideoHelp progName = \case
                    , "  " <> toText progName <> " xai --edit=clip.mp4 \"make the lighting moodier\""
                    , "  " <> toText progName <> " xai --extend=clip.mp4 \"continue the scene for 5 more seconds\""
                    ]
+    GenVideoHelpVeo ->
+        T.unlines $
+            [ "Usage:"
+            , "  " <> toText progName <> " veo [OPTIONS] PROMPT"
+            , ""
+            , "Default model: veo-3.1-generate-preview"
+            , ""
+            , "Common options:"
+            ]
+                <> commonOptionLines
+                <> [ ""
+                   , "veo options:"
+                   ]
+                <> veoOptionLines
+                <> [ ""
+                   , "Notes:"
+                   , "  SOURCE can be a URL, a data URL, or a local image path."
+                   , "  With no source option, the CLI sends a text-to-video request."
+                   , "  Use `--image SOURCE` to animate one still image as the first frame."
+                   , "  Use `--image START --last-frame END` for first/last frame interpolation."
+                   , "  If `--aspect-ratio` is omitted for a Veo image request, source image dimensions are used to pick 16:9 or 9:16."
+                   , "  GEMINI_API_KEY is required."
+                   , ""
+                   , "Examples:"
+                   , "  " <> toText progName <> " veo \"A cinematic shot of a lion in the savannah\""
+                   , "  " <> toText progName <> " veo --image=start.png \"animate this still frame\""
+                   , "  " <> toText progName <> " veo --image=start.png --last-frame=end.png --duration=8 \"move from the first frame to the final frame\""
+                   ]
   where
     commonOptionLines =
         [ "  -o, --output PATH            Output file path or filename prefix."
@@ -534,6 +855,19 @@ renderGenVideoHelp progName = \case
         , "  --duration SECONDS           Duration hint for image-to-video or extend."
         , "  --aspect-ratio RATIO         Aspect ratio hint, for example 16:9."
         , "  --resolution RESOLUTION      Resolution hint, for example 720p."
+        , "  --poll-interval-ms N         Poll interval in milliseconds. Default: 5000"
+        , "  --max-poll-attempts N        Maximum poll attempts. Default: 120"
+        ]
+
+    veoOptionLines =
+        [ "  --model MODEL                Override the Veo model."
+        , "  --image SOURCE               First frame image URL, data URL, or local file."
+        , "  --last-frame SOURCE          Final frame image URL, data URL, or local file."
+        , "  --duration SECONDS           Duration hint, for example 4, 6, or 8; first/last frame interpolation requires 8."
+        , "  --aspect-ratio RATIO         Aspect ratio hint, for example 16:9 or 9:16."
+        , "  --resolution RESOLUTION      Resolution hint, for example 720p, 1080p, or 4k."
+        , "  --person-generation VALUE    Person generation setting, for example allow_adult."
+        , "  --seed N                     Provider seed hint."
         , "  --poll-interval-ms N         Poll interval in milliseconds. Default: 5000"
         , "  --max-poll-attempts N        Maximum poll attempts. Default: 120"
         ]
@@ -827,3 +1161,9 @@ renderVideoStatus = \case
         "failed"
     XAIVideoUnknown other ->
         other
+
+renderGeminiVideoError :: GeminiVideoError -> Text
+renderGeminiVideoError GeminiVideoError{code, message, status} =
+    T.intercalate
+        " "
+        (catMaybes [("code=" <>) . show <$> code, ("status=" <>) <$> status, message])
