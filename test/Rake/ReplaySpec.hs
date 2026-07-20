@@ -531,11 +531,7 @@ spec = describe "Rake.Replay" $ do
                 Render.lookupPath ["input"] requestBody
                     `shouldBe` Just
                         ( toJSON
-                            ( [ object
-                                    [ "role" .= ("user" :: Text)
-                                    , "content" .= ([requestPart] :: [Value])
-                                    ]
-                              ]
+                            ( [storedUserInputStep providerFamily requestPart]
                                 :: [Value]
                             )
                         )
@@ -551,11 +547,7 @@ spec = describe "Rake.Replay" $ do
                 Render.lookupPath ["input"] requestBody
                     `shouldBe` Just
                         ( toJSON
-                            ( [ object
-                                    [ "role" .= ("user" :: Text)
-                                    , "content" .= ([requestPart] :: [Value])
-                                    ]
-                              ]
+                            ( [storedUserInputStep providerFamily requestPart]
                                 :: [Value]
                             )
                         )
@@ -885,6 +877,20 @@ captureStoredGeminiRequestBody mediaReferences history = do
 
     result `shouldSatisfy` isLeft
     Render.readRequest requestRef
+
+storedUserInputStep :: ProviderApiFamily -> Value -> Value
+storedUserInputStep providerFamily requestPart =
+    case providerFamily of
+        ProviderGeminiInteractions ->
+            object
+                [ "type" .= ("user_input" :: Text)
+                , "content" .= ([requestPart] :: [Value])
+                ]
+        _ ->
+            object
+                [ "role" .= ("user" :: Text)
+                , "content" .= ([requestPart] :: [Value])
+                ]
 
 imageRequestPart :: ProviderApiFamily -> Value
 imageRequestPart = \case
