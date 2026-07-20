@@ -3,18 +3,16 @@ ai-rake is a library for supplier agnostic llms calls with automatic tool call h
 ## Workflow
 
 - `process-compose` is the expected local build/test/ghcid interface.
-- Assume `process-compose` is already running outside of the agent process; use
-  the configured `process-compose process ...` commands against that manager.
+- Assume the process manager is already running in the background and is owned
+  outside of the agent process. Only use the configured
+  `process-compose process ...` commands against that manager.
+- Never start, stop, or replace the process manager yourself, including by
+  running `nix develop -c process-compose up`. If its server is unavailable,
+  report that instead of launching a new instance.
 - Do not run `cabal build` / `cabal test` directly; use the configured
   `process-compose` processes instead.
 - The output from ghcid is continuously written to `ghcid.log`; read it to get
   compiler feedback.
-
-Start the process manager from the repo root with:
-
-```bash
-nix develop -c process-compose up
-```
 
 The Nix dev shell sets `PC_PORT_NUM=6599`, so process-compose should use port
 6599 for its server.
