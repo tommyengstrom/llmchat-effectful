@@ -22,6 +22,7 @@ import Rake
 import Rake.MediaStorage.InMemory
 import Rake.Providers.Gemini.Chat
 import Rake.Providers.OpenAI.Chat
+import Rake.Providers.OpenAI.Chat qualified as OpenAI
 import Rake.Providers.XAI.Chat
 import Rake.Providers.XAI.Imagine
 import Relude
@@ -176,6 +177,54 @@ spec = describe "Responses request rendering" $ do
                     [user "hello"]
 
             lookupPath ["top_p"] requestBody `shouldBe` Nothing
+
+    describe "OpenAI reasoning effort" $ do
+        it "omits reasoning from default OpenAI requests" $ do
+            requestBody <- captureOpenAIRequestBody defaultChatConfig [user "hello"]
+
+            lookupPath ["reasoning"] requestBody `shouldBe` Nothing
+
+        forM_ openAIReasoningEffortCases $ \(reasoningEffort, encodedEffort) ->
+            it (toString ("encodes " <> show reasoningEffort <> " as " <> encodedEffort)) $ do
+                requestBody <-
+                    captureOpenAIRequestBodyWithReasoningEffort
+                        reasoningEffort
+                        defaultChatConfig
+                        [user "hello"]
+
+                lookupPath ["reasoning", "effort"] requestBody
+                    `shouldBe` Just (String encodedEffort)
+
+        it "renders OpenAIReasoningNone as the complete reasoning object" $ do
+            requestBody <-
+                captureOpenAIRequestBodyWithReasoningEffort
+                    OpenAIReasoningNone
+                    defaultChatConfig
+                    [user "hello"]
+
+            lookupPath ["reasoning"] requestBody
+                `shouldBe` Just (object ["effort" .= ("none" :: Text)])
+
+        it "keeps shared sampling fields unchanged and reasoning out of xAI requests" $ do
+            let samplingOptions =
+                    withTopP (Just 0.75)
+                        $ withTemperature (Just 0.25) defaultSamplingOptions
+                chatConfig = withSampling samplingOptions defaultChatConfig
+
+            openAIRequestBody <-
+                captureOpenAIRequestBodyWithReasoningEffort
+                    OpenAIReasoningMedium
+                    chatConfig
+                    [user "hello"]
+            xaiRequestBody <- captureXAIRequestBody chatConfig [user "hello"]
+
+            forM_ ([openAIRequestBody, xaiRequestBody] :: [Value]) $ \requestBody -> do
+                lookupPath ["temperature"] requestBody `shouldBe` Just (Number 0.25)
+                lookupPath ["top_p"] requestBody `shouldBe` Just (Number 0.75)
+                lookupPath ["store"] requestBody `shouldBe` Just (Bool False)
+            lookupPath ["reasoning", "effort"] openAIRequestBody
+                `shouldBe` Just (String "medium")
+            lookupPath ["reasoning"] xaiRequestBody `shouldBe` Nothing
 
     describe "native history rendering" $ do
         it "projects OpenAI-native items into canonical OpenAI input" $ do
@@ -1815,6 +1864,16 @@ generatedTools count =
     | toolIndex <- [1 .. count]
     ]
 
+openAIReasoningEffortCases :: [(OpenAIReasoningEffort, Text)]
+openAIReasoningEffortCases =
+    [ (OpenAIReasoningNone, "none")
+    , (OpenAIReasoningLow, "low")
+    , (OpenAIReasoningMedium, "medium")
+    , (OpenAIReasoningHigh, "high")
+    , (OpenAIReasoningXHigh, "xhigh")
+    , (OpenAIReasoningMax, "max")
+    ]
+
 captureOpenAIRequestBody
     :: ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
@@ -1823,13 +1882,28 @@ captureOpenAIRequestBody chatConfig history = do
     requestBody <- captureOpenAIRequestBodyWithMediaReferences [] chatConfig history
     pure requestBody
 
+captureOpenAIRequestBodyWithReasoningEffort
+    :: OpenAIReasoningEffort
+    -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> [HistoryItem]
+    -> IO Value
+captureOpenAIRequestBodyWithReasoningEffort reasoningEffort chatConfig history = do
+    (requestBody, _) <-
+        captureOpenAIRenderWithMediaReferencesAndReasoningEffort
+            []
+            (Just reasoningEffort)
+            chatConfig
+            history
+    pure requestBody
+
 captureOpenAIRequestBodyWithMediaReferences
     :: [MediaProviderReference]
     -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
     -> IO Value
 captureOpenAIRequestBodyWithMediaReferences mediaReferences chatConfig history = do
-    (requestBody, _) <- captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history
+    (requestBody, _) <-
+        captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history
     pure requestBody
 
 captureOpenAIRender
@@ -1844,25 +1918,25 @@ captureOpenAIRenderWithMediaReferences
     -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
     -> IO (Value, [Text])
-captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history = do
+captureOpenAIRenderWithMediaReferences mediaReferences =
+    captureOpenAIRenderWithMediaReferencesAndReasoningEffort mediaReferences Nothing
+
+captureOpenAIRenderWithMediaReferencesAndReasoningEffort
+    :: [MediaProviderReference]
+    -> Maybe OpenAIReasoningEffort
+    -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> [HistoryItem]
+    -> IO (Value, [Text])
+captureOpenAIRenderWithMediaReferencesAndReasoningEffort mediaReferences configuredReasoningEffort chatConfig history = do
     requestRef <- IORef.newIORef Nothing
     notesRef <- IORef.newIORef []
-    let OpenAIChatSettings
-            { apiKey = defaultApiKey
-            , model = defaultModel
-            , organizationId = defaultOrganizationId
-            , projectId = defaultProjectId
-            } = defaultOpenAIChatSettings "test-api-key"
-        settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
+    let settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
         settings =
-                OpenAIChatSettings
-                    { apiKey = defaultApiKey
-                    , model = defaultModel
-                    , baseUrl = unreachableBaseUrl
-                    , organizationId = defaultOrganizationId
-                    , projectId = defaultProjectId
-                    , requestLogger = recordRequestAndNotes requestRef notesRef
-                    }
+            (defaultOpenAIChatSettings "test-api-key")
+                { OpenAI.baseUrl = unreachableBaseUrl
+                , OpenAI.reasoningEffort = configuredReasoningEffort
+                , OpenAI.requestLogger = recordRequestAndNotes requestRef notesRef
+                }
 
     result <-
         runEff
@@ -1892,21 +1966,11 @@ runOpenAIRenderResultWithMediaReferences
     -> [HistoryItem]
     -> IO (Either RakeError ())
 runOpenAIRenderResultWithMediaReferences mediaReferences chatConfig history = do
-    let OpenAIChatSettings
-            { apiKey = defaultApiKey
-            , model = defaultModel
-            , organizationId = defaultOrganizationId
-            , projectId = defaultProjectId
-            } = defaultOpenAIChatSettings "test-api-key"
-        settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
+    let settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
         settings =
-            OpenAIChatSettings
-                { apiKey = defaultApiKey
-                , model = defaultModel
-                , baseUrl = unreachableBaseUrl
-                , organizationId = defaultOrganizationId
-                , projectId = defaultProjectId
-                , requestLogger = \_ -> pure ()
+            (defaultOpenAIChatSettings "test-api-key")
+                { OpenAI.baseUrl = unreachableBaseUrl
+                , OpenAI.requestLogger = \_ -> pure ()
                 }
 
     runEff

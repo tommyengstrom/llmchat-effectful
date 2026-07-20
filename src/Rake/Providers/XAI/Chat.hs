@@ -49,6 +49,7 @@ runRakeXAIChat XAIChatSettings{..} =
             , baseUrl
             , organizationId = Nothing
             , projectId = Nothing
+            , reasoningConfig = Nothing
             , requestLogger
             }
 
