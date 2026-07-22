@@ -1,9 +1,13 @@
 module Rake.Provider.ResponsesRenderSpec where
 
-import Control.Exception (ErrorCall (ErrorCall), finally)
+import Control.Concurrent qualified as Concurrent
+import Control.Exception (ErrorCall (ErrorCall), bracket, finally)
 import Data.Aeson
 import Data.Aeson.Key qualified as Key
 import Data.Aeson.KeyMap qualified as KM
+import Data.ByteString qualified as BS
+import Data.ByteString.Char8 qualified as BC8
+import Data.ByteString.Lazy qualified as LBS
 import Data.IORef qualified as IORef
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
@@ -12,10 +16,13 @@ import Effectful.Error.Static
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import Network.HTTP.Types.Status (accepted202)
 import Network.HTTP.Types.Version (http11)
+import Network.Socket qualified as Socket
+import Network.Socket.ByteString qualified as SocketBS
 import Rake
 import Rake.MediaStorage.InMemory
 import Rake.Providers.Gemini.Chat
 import Rake.Providers.OpenAI.Chat
+import Rake.Providers.OpenAI.Chat qualified as OpenAI
 import Rake.Providers.XAI.Chat
 import Rake.Providers.XAI.Imagine
 import Relude
@@ -108,17 +115,19 @@ spec = describe "Responses request rendering" $ do
                 toolCount xaiRequestBody `shouldBe` Just toolCountToRender
                 toolCount geminiRequestBody `shouldBe` Just toolCountToRender
 
-        it "renders Gemini structured response schemas as response_format only" $ do
+        it "renders Gemini structured response schemas in the current response_format envelope" $ do
             requestBody <-
                 captureGeminiRequestBody
                     (withResponseFormat (jsonSchemaFormat @RecordWithMaybe) defaultChatConfig)
                     [user "hello"]
 
             lookupPath ["response_mime_type"] requestBody `shouldBe` Nothing
-            lookupPath ["response_format", "type"] requestBody `shouldBe` Just (String "object")
-            lookupPath ["response_format", "properties", "toolCall", "type"] requestBody
+            lookupPath ["response_format", "type"] requestBody `shouldBe` Just (String "text")
+            lookupPath ["response_format", "mime_type"] requestBody `shouldBe` Just (String "application/json")
+            lookupPath ["response_format", "schema", "type"] requestBody `shouldBe` Just (String "object")
+            lookupPath ["response_format", "schema", "properties", "toolCall", "type"] requestBody
                 `shouldBe` Just (toJSON (["object", "null"] :: [Text]))
-            lookupPath ["response_format", "properties", "toolCall", "anyOf"] requestBody `shouldBe` Nothing
+            lookupPath ["response_format", "schema", "properties", "toolCall", "anyOf"] requestBody `shouldBe` Nothing
 
         it "adds Gemini response_format types for enum and sum schemas" $ do
             enumRequestBody <-
@@ -130,10 +139,10 @@ spec = describe "Responses request rendering" $ do
                     (withResponseFormat (jsonSchemaFormat @NonNullarySum) defaultChatConfig)
                     [user "hello"]
 
-            lookupPath ["response_format", "type"] enumRequestBody `shouldBe` Just (String "string")
-            lookupPath ["response_format", "type"] sumRequestBody `shouldBe` Just (String "object")
-            lookupPath ["response_format", "oneOf"] sumRequestBody `shouldBe` Nothing
-            lookupPath ["response_format", "properties", "tag", "enum"] sumRequestBody
+            lookupPath ["response_format", "schema", "type"] enumRequestBody `shouldBe` Just (String "string")
+            lookupPath ["response_format", "schema", "type"] sumRequestBody `shouldBe` Just (String "object")
+            lookupPath ["response_format", "schema", "oneOf"] sumRequestBody `shouldBe` Nothing
+            lookupPath ["response_format", "schema", "properties", "tag", "enum"] sumRequestBody
                 `shouldBe` Just (toJSON (["SumText", "SumCount"] :: [Text]))
 
     describe "sampling options" $ do
@@ -168,6 +177,54 @@ spec = describe "Responses request rendering" $ do
                     [user "hello"]
 
             lookupPath ["top_p"] requestBody `shouldBe` Nothing
+
+    describe "OpenAI reasoning effort" $ do
+        it "omits reasoning from default OpenAI requests" $ do
+            requestBody <- captureOpenAIRequestBody defaultChatConfig [user "hello"]
+
+            lookupPath ["reasoning"] requestBody `shouldBe` Nothing
+
+        forM_ openAIReasoningEffortCases $ \(reasoningEffort, encodedEffort) ->
+            it (toString ("encodes " <> show reasoningEffort <> " as " <> encodedEffort)) $ do
+                requestBody <-
+                    captureOpenAIRequestBodyWithReasoningEffort
+                        reasoningEffort
+                        defaultChatConfig
+                        [user "hello"]
+
+                lookupPath ["reasoning", "effort"] requestBody
+                    `shouldBe` Just (String encodedEffort)
+
+        it "renders OpenAIReasoningNone as the complete reasoning object" $ do
+            requestBody <-
+                captureOpenAIRequestBodyWithReasoningEffort
+                    OpenAIReasoningNone
+                    defaultChatConfig
+                    [user "hello"]
+
+            lookupPath ["reasoning"] requestBody
+                `shouldBe` Just (object ["effort" .= ("none" :: Text)])
+
+        it "keeps shared sampling fields unchanged and reasoning out of xAI requests" $ do
+            let samplingOptions =
+                    withTopP (Just 0.75)
+                        $ withTemperature (Just 0.25) defaultSamplingOptions
+                chatConfig = withSampling samplingOptions defaultChatConfig
+
+            openAIRequestBody <-
+                captureOpenAIRequestBodyWithReasoningEffort
+                    OpenAIReasoningMedium
+                    chatConfig
+                    [user "hello"]
+            xaiRequestBody <- captureXAIRequestBody chatConfig [user "hello"]
+
+            forM_ ([openAIRequestBody, xaiRequestBody] :: [Value]) $ \requestBody -> do
+                lookupPath ["temperature"] requestBody `shouldBe` Just (Number 0.25)
+                lookupPath ["top_p"] requestBody `shouldBe` Just (Number 0.75)
+                lookupPath ["store"] requestBody `shouldBe` Just (Bool False)
+            lookupPath ["reasoning", "effort"] openAIRequestBody
+                `shouldBe` Just (String "medium")
+            lookupPath ["reasoning"] xaiRequestBody `shouldBe` Nothing
 
     describe "native history rendering" $ do
         it "projects OpenAI-native items into canonical OpenAI input" $ do
@@ -486,7 +543,8 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Just
                     ( toJSON
                         ( [ object
-                                [ "role" .= ("model" :: Text)
+                                [ "id" .= ("item-gemini" :: Text)
+                                , "type" .= ("model_output" :: Text)
                                 , "content"
                                     .= ( [ object
                                                 [ "type" .= ("text" :: Text)
@@ -536,12 +594,8 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Just
                     ( toJSON
                         ( [ object
-                                [ "role" .= ("model" :: Text)
-                                , "content"
-                                    .= ( [ geminiThoughtPayload "thought-1"
-                                         ]
-                                            :: [Value]
-                                       )
+                                [ "signature" .= ("thought-1" :: Text)
+                                , "type" .= ("thought" :: Text)
                                 ]
                           ]
                             :: [Value]
@@ -589,29 +643,18 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Just
                     ( toJSON
                         ( [ object
-                                [ "role" .= ("model" :: Text)
-                                , "content"
-                                    .= ( [ geminiThoughtPayload "thought-1"
-                                         , geminiFunctionCallPayload "tool-call-1" "lookup" (object ["name" .= ("John Snow" :: Text)])
-                                         ]
-                                            :: [Value]
-                                       )
+                                [ "signature" .= ("thought-1" :: Text)
+                                , "type" .= ("thought" :: Text)
                                 ]
+                          , geminiFunctionCallPayload "tool-call-1" "lookup" (object ["name" .= ("John Snow" :: Text)])
                           , object
-                                [ "role" .= ("user" :: Text)
-                                , "content"
+                                [ "type" .= ("function_result" :: Text)
+                                , "name" .= ("lookup" :: Text)
+                                , "call_id" .= ("tool-call-1" :: Text)
+                                , "result"
                                     .= ( [ object
-                                                [ "type" .= ("function_result" :: Text)
-                                                , "name" .= ("lookup" :: Text)
-                                                , "call_id" .= ("tool-call-1" :: Text)
-                                                , "result"
-                                                    .= ( [ object
-                                                                [ "type" .= ("text" :: Text)
-                                                                , "text" .= ("Contacts:\n- John Snow" :: Text)
-                                                                ]
-                                                           ]
-                                                            :: [Value]
-                                                       )
+                                                [ "type" .= ("text" :: Text)
+                                                , "text" .= ("Contacts:\n- John Snow" :: Text)
                                                 ]
                                            ]
                                             :: [Value]
@@ -622,7 +665,7 @@ spec = describe "Responses request rendering" $ do
                         )
                     )
 
-        it "injects a dummy thought signature for foreign tool continuations rendered into Gemini" $ do
+        it "renders foreign tool continuations without an invalid thought signature" $ do
             let pendingForeignToolCall =
                     nativeHistoryItem
                         ProviderOpenAIResponses
@@ -642,34 +685,19 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Just
                     ( toJSON
                         ( [ object
-                                [ "role" .= ("model" :: Text)
-                                , "content"
-                                    .= ( [ object
-                                                [ "type" .= ("function_call" :: Text)
-                                                , "id" .= ("tool-call-1" :: Text)
-                                                , "name" .= ("lookup" :: Text)
-                                                , "thought_signature" .= ("context_engineering_is_the_way_to_go" :: Text)
-                                                , "arguments" .= object []
-                                                ]
-                                           ]
-                                            :: [Value]
-                                       )
+                                [ "type" .= ("function_call" :: Text)
+                                , "id" .= ("tool-call-1" :: Text)
+                                , "name" .= ("lookup" :: Text)
+                                , "arguments" .= object []
                                 ]
                           , object
-                                [ "role" .= ("user" :: Text)
-                                , "content"
+                                [ "type" .= ("function_result" :: Text)
+                                , "name" .= ("lookup" :: Text)
+                                , "call_id" .= ("tool-call-1" :: Text)
+                                , "result"
                                     .= ( [ object
-                                                [ "type" .= ("function_result" :: Text)
-                                                , "name" .= ("lookup" :: Text)
-                                                , "call_id" .= ("tool-call-1" :: Text)
-                                                , "result"
-                                                    .= ( [ object
-                                                                [ "type" .= ("text" :: Text)
-                                                                , "text" .= ("Contacts:\n- Ada" :: Text)
-                                                                ]
-                                                           ]
-                                                            :: [Value]
-                                                       )
+                                                [ "type" .= ("text" :: Text)
+                                                , "text" .= ("Contacts:\n- Ada" :: Text)
                                                 ]
                                            ]
                                             :: [Value]
@@ -835,7 +863,7 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Just
                     ( toJSON
                         ( [ object
-                                [ "role" .= ("user" :: Text)
+                                [ "type" .= ("user_input" :: Text)
                                 , "content"
                                     .= ( [ object
                                                 [ "type" .= ("text" :: Text)
@@ -1499,6 +1527,24 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Right
                     (providerRound [nativeHistoryItem ProviderGeminiInteractions ItemCompleted "interaction-gemini" (Just "item-gemini") payload] [] ProviderRoundDone)
 
+        it "continues to decode legacy Gemini outputs and flat text payloads" $ do
+            let payload =
+                    object
+                        [ "id" .= ("item-gemini" :: Text)
+                        , "type" .= ("text" :: Text)
+                        , "text" .= ("legacy assistant text" :: Text)
+                        ]
+                response =
+                    object
+                        [ "id" .= ("interaction-gemini" :: Text)
+                        , "status" .= ("completed" :: Text)
+                        , "outputs" .= ([payload] :: [Value])
+                        ]
+
+            decodeGeminiResponse response
+                `shouldBe` Right
+                    (providerRound [nativeHistoryItem ProviderGeminiInteractions ItemCompleted "interaction-gemini" (Just "item-gemini") payload] [] ProviderRoundDone)
+
         it "decodes Gemini requires_action rounds as pending tool handoff" $ do
             let payload =
                     geminiFunctionCallPayload
@@ -1517,7 +1563,7 @@ spec = describe "Responses request rendering" $ do
                 `shouldBe` Right
                     (providerRound [nativeHistoryItem ProviderGeminiInteractions ItemPending "interaction-gemini" (Just "item-gemini-tool") payload] [] (ProviderRoundNeedsLocalTools [expectedToolCall]))
 
-        it "falls back to the first output identifier as the Gemini exchange id when store=false omits it" $ do
+        it "falls back to the first step identifier as the Gemini exchange id when store=false omits it" $ do
             let thoughtPayload = geminiThoughtPayload "thought-1"
                 toolPayload =
                     geminiFunctionCallPayload
@@ -1527,7 +1573,7 @@ spec = describe "Responses request rendering" $ do
                 rawResponse =
                     object
                         [ "status" .= ("requires_action" :: Text)
-                        , "outputs" .= ([thoughtPayload, toolPayload] :: [Value])
+                        , "steps" .= ([thoughtPayload, toolPayload] :: [Value])
                         ]
                 expectedToolCall =
                     ToolCall
@@ -1576,7 +1622,7 @@ spec = describe "Responses request rendering" $ do
                                 [ "code" .= ("too_many_tools" :: Text)
                                 , "message" .= ("Too many function declarations." :: Text)
                                 ]
-                        , "outputs" .= ([] :: [Value])
+                        , "steps" .= ([] :: [Value])
                         ]
 
             decodeGeminiResponse response
@@ -1605,6 +1651,132 @@ spec = describe "Responses request rendering" $ do
                             )
                         )
                     )
+
+    describe "Gemini current streaming schema" $ do
+        it "accumulates thought and model-output steps when completion omits steps" $ do
+            streamedTextsRef <- IORef.newIORef ([] :: [Text])
+            result <-
+                runGeminiSseFixture
+                    [ geminiStreamCreatedEvent
+                    , object
+                        [ "event_type" .= ("step.start" :: Text)
+                        , "index" .= (0 :: Int)
+                        , "step" .= object ["type" .= ("thought" :: Text)]
+                        ]
+                    , object
+                        [ "event_type" .= ("step.delta" :: Text)
+                        , "index" .= (0 :: Int)
+                        , "delta"
+                            .= object
+                                [ "type" .= ("thought_signature" :: Text)
+                                , "signature" .= ("thought-signature" :: Text)
+                                ]
+                        ]
+                    , geminiStepStopEvent 0
+                    , object
+                        [ "event_type" .= ("step.start" :: Text)
+                        , "index" .= (1 :: Int)
+                        , "step"
+                            .= object
+                                [ "type" .= ("model_output" :: Text)
+                                , "content"
+                                    .= ( [ object
+                                                [ "type" .= ("text" :: Text)
+                                                , "text" .= ("Hello " :: Text)
+                                                ]
+                                           ]
+                                            :: [Value]
+                                       )
+                                ]
+                        ]
+                    , object
+                        [ "event_type" .= ("step.delta" :: Text)
+                        , "index" .= (1 :: Int)
+                        , "delta"
+                            .= object
+                                [ "type" .= ("text" :: Text)
+                                , "text" .= ("world" :: Text)
+                                ]
+                        ]
+                    , geminiStepStopEvent 1
+                    , geminiStreamTerminalEvent "interaction.completed" "completed"
+                    ]
+                    defaultStreamCallbacks
+                        { onAssistantTextDelta = \deltaText ->
+                            liftIO (IORef.modifyIORef' streamedTextsRef (<> [deltaText]))
+                        }
+                    defaultChatConfig{llmCallTimeout = Just 5}
+
+            IORef.readIORef streamedTextsRef `shouldReturn` ["Hello ", "world"]
+            case result of
+                Right ChatFinished{appendedItems} -> do
+                    concatMap itemTexts appendedItems `shouldBe` ["Hello ", "world"]
+                    geminiProviderPayloads appendedItems
+                        `shouldContain` [object ["type" .= ("thought" :: Text), "signature" .= ("thought-signature" :: Text)]]
+                other ->
+                    expectationFailure ("Unexpected Gemini streamed text result: " <> show other)
+
+        it "accumulates fragmented function-call arguments for requires_action" $ do
+            result <-
+                runGeminiSseFixture
+                    [ geminiStreamCreatedEvent
+                    , object
+                        [ "event_type" .= ("step.start" :: Text)
+                        , "index" .= (0 :: Int)
+                        , "step" .= object ["type" .= ("thought" :: Text)]
+                        ]
+                    , object
+                        [ "event_type" .= ("step.delta" :: Text)
+                        , "index" .= (0 :: Int)
+                        , "delta"
+                            .= object
+                                [ "type" .= ("thought_signature" :: Text)
+                                , "signature" .= ("tool-thought" :: Text)
+                                ]
+                        ]
+                    , geminiStepStopEvent 0
+                    , object
+                        [ "event_type" .= ("step.start" :: Text)
+                        , "index" .= (1 :: Int)
+                        , "step"
+                            .= object
+                                [ "type" .= ("function_call" :: Text)
+                                , "id" .= ("tool-call-1" :: Text)
+                                , "name" .= ("lookup" :: Text)
+                                , "arguments" .= object []
+                                ]
+                        ]
+                    , geminiArgumentsDeltaEvent 1 "{\"name\":\""
+                    , geminiArgumentsDeltaEvent 1 "Ada\"}"
+                    , geminiStepStopEvent 1
+                    , object ["event_type" .= ("interaction.requires_action" :: Text)]
+                    ]
+                    defaultStreamCallbacks
+                    defaultChatConfig
+                        { maxToolRounds = 0
+                        , llmCallTimeout = Just 5
+                        }
+
+            case result of
+                Right
+                    ChatPaused
+                        { appendedItems =
+                            [ HistoryItem
+                                { genericItem =
+                                    GenericToolCall
+                                        { toolCall = ToolCall{toolCallId, toolName, toolArgs, continuationAttachments}
+                                        }
+                                }
+                            ]
+                        , pauseReason = PauseToolLoopLimit 0
+                        } -> do
+                            toolCallId `shouldBe` "tool-call-1"
+                            toolName `shouldBe` "lookup"
+                            toolArgs `shouldBe` fromList [("name", String "Ada")]
+                            continuationAttachments
+                                `shouldBe` [ToolCallContinuation ProviderGeminiInteractions (object ["type" .= ("thought" :: Text), "signature" .= ("tool-thought" :: Text)])]
+                other ->
+                    expectationFailure ("Unexpected Gemini streamed tool result: " <> show other)
 
     describe "default logging" $ do
         it "warns on OpenAI conversion notes and request failures" $ do
@@ -1692,6 +1864,16 @@ generatedTools count =
     | toolIndex <- [1 .. count]
     ]
 
+openAIReasoningEffortCases :: [(OpenAIReasoningEffort, Text)]
+openAIReasoningEffortCases =
+    [ (OpenAIReasoningNone, "none")
+    , (OpenAIReasoningLow, "low")
+    , (OpenAIReasoningMedium, "medium")
+    , (OpenAIReasoningHigh, "high")
+    , (OpenAIReasoningXHigh, "xhigh")
+    , (OpenAIReasoningMax, "max")
+    ]
+
 captureOpenAIRequestBody
     :: ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
@@ -1700,13 +1882,28 @@ captureOpenAIRequestBody chatConfig history = do
     requestBody <- captureOpenAIRequestBodyWithMediaReferences [] chatConfig history
     pure requestBody
 
+captureOpenAIRequestBodyWithReasoningEffort
+    :: OpenAIReasoningEffort
+    -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> [HistoryItem]
+    -> IO Value
+captureOpenAIRequestBodyWithReasoningEffort reasoningEffort chatConfig history = do
+    (requestBody, _) <-
+        captureOpenAIRenderWithMediaReferencesAndReasoningEffort
+            []
+            (Just reasoningEffort)
+            chatConfig
+            history
+    pure requestBody
+
 captureOpenAIRequestBodyWithMediaReferences
     :: [MediaProviderReference]
     -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
     -> IO Value
 captureOpenAIRequestBodyWithMediaReferences mediaReferences chatConfig history = do
-    (requestBody, _) <- captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history
+    (requestBody, _) <-
+        captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history
     pure requestBody
 
 captureOpenAIRender
@@ -1721,25 +1918,25 @@ captureOpenAIRenderWithMediaReferences
     -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
     -> [HistoryItem]
     -> IO (Value, [Text])
-captureOpenAIRenderWithMediaReferences mediaReferences chatConfig history = do
+captureOpenAIRenderWithMediaReferences mediaReferences =
+    captureOpenAIRenderWithMediaReferencesAndReasoningEffort mediaReferences Nothing
+
+captureOpenAIRenderWithMediaReferencesAndReasoningEffort
+    :: [MediaProviderReference]
+    -> Maybe OpenAIReasoningEffort
+    -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> [HistoryItem]
+    -> IO (Value, [Text])
+captureOpenAIRenderWithMediaReferencesAndReasoningEffort mediaReferences configuredReasoningEffort chatConfig history = do
     requestRef <- IORef.newIORef Nothing
     notesRef <- IORef.newIORef []
-    let OpenAIChatSettings
-            { apiKey = defaultApiKey
-            , model = defaultModel
-            , organizationId = defaultOrganizationId
-            , projectId = defaultProjectId
-            } = defaultOpenAIChatSettings "test-api-key"
-        settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
+    let settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
         settings =
-                OpenAIChatSettings
-                    { apiKey = defaultApiKey
-                    , model = defaultModel
-                    , baseUrl = unreachableBaseUrl
-                    , organizationId = defaultOrganizationId
-                    , projectId = defaultProjectId
-                    , requestLogger = recordRequestAndNotes requestRef notesRef
-                    }
+            (defaultOpenAIChatSettings "test-api-key")
+                { OpenAI.baseUrl = unreachableBaseUrl
+                , OpenAI.reasoningEffort = configuredReasoningEffort
+                , OpenAI.requestLogger = recordRequestAndNotes requestRef notesRef
+                }
 
     result <-
         runEff
@@ -1769,21 +1966,11 @@ runOpenAIRenderResultWithMediaReferences
     -> [HistoryItem]
     -> IO (Either RakeError ())
 runOpenAIRenderResultWithMediaReferences mediaReferences chatConfig history = do
-    let OpenAIChatSettings
-            { apiKey = defaultApiKey
-            , model = defaultModel
-            , organizationId = defaultOrganizationId
-            , projectId = defaultProjectId
-            } = defaultOpenAIChatSettings "test-api-key"
-        settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
+    let settings :: OpenAIChatSettings '[RakeMediaStorage, Error RakeError, IOE]
         settings =
-            OpenAIChatSettings
-                { apiKey = defaultApiKey
-                , model = defaultModel
-                , baseUrl = unreachableBaseUrl
-                , organizationId = defaultOrganizationId
-                , projectId = defaultProjectId
-                , requestLogger = \_ -> pure ()
+            (defaultOpenAIChatSettings "test-api-key")
+                { OpenAI.baseUrl = unreachableBaseUrl
+                , OpenAI.requestLogger = \_ -> pure ()
                 }
 
     runEff
@@ -1912,6 +2099,110 @@ runGeminiRenderResult chatConfig history = do
         $ void
         $ chatOutcome chatConfig history
 
+runGeminiSseFixture
+    :: [Value]
+    -> StreamCallbacks '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> ChatConfig '[Rake, RakeMediaStorage, Error RakeError, IOE]
+    -> IO (Either RakeError ChatOutcome)
+runGeminiSseFixture streamEvents streamCallbacks chatConfig =
+    withGeminiSseServer streamEvents $ \fixtureBaseUrl -> do
+        let GeminiChatSettings
+                { apiKey = defaultApiKey
+                , model = defaultModel
+                , systemInstruction = defaultSystemInstruction
+                , providerTools = defaultProviderTools
+                , generationConfig = defaultGenerationConfig
+                } = defaultGeminiChatSettings "test-api-key"
+            settings :: GeminiChatSettings '[RakeMediaStorage, Error RakeError, IOE]
+            settings =
+                GeminiChatSettings
+                    { apiKey = defaultApiKey
+                    , model = defaultModel
+                    , baseUrl = fixtureBaseUrl
+                    , systemInstruction = defaultSystemInstruction
+                    , providerTools = defaultProviderTools
+                    , generationConfig = defaultGenerationConfig
+                    , requestLogger = \_ -> pure ()
+                    }
+        runEff
+            . runErrorNoCallStack
+            . runRakeMediaStorageInMemory
+            $ runRakeGeminiChat settings
+            $ streamChatOutcome streamCallbacks chatConfig [user "hello"]
+
+withGeminiSseServer :: [Value] -> (Text -> IO a) -> IO a
+withGeminiSseServer streamEvents action =
+    Socket.withSocketsDo
+        $ bracket openListener Socket.close
+        $ \listener -> do
+            listenerAddress <- Socket.getSocketName listener
+            fixturePort <- case listenerAddress of
+                Socket.SockAddrInet port _ ->
+                    pure port
+                otherAddress ->
+                    error ("Unexpected Gemini SSE fixture address: " <> show otherAddress)
+            serverThread <- Concurrent.forkIO (serveGeminiSseFixture listener streamEvents)
+            action ("http://127.0.0.1:" <> show fixturePort)
+                `finally` Concurrent.killThread serverThread
+  where
+    openListener = do
+        listener <- Socket.socket Socket.AF_INET Socket.Stream Socket.defaultProtocol
+        Socket.setSocketOption listener Socket.ReuseAddr 1
+        Socket.bind listener (Socket.SockAddrInet 0 (Socket.tupleToHostAddress (127, 0, 0, 1)))
+        Socket.listen listener 1
+        pure listener
+
+serveGeminiSseFixture :: Socket.Socket -> [Value] -> IO ()
+serveGeminiSseFixture listener streamEvents =
+    bracket (fst <$> Socket.accept listener) Socket.close $ \clientSocket -> do
+        receiveHttpRequest clientSocket
+        SocketBS.sendAll clientSocket (geminiSseHttpResponse streamEvents)
+
+receiveHttpRequest :: Socket.Socket -> IO ()
+receiveHttpRequest clientSocket = do
+    (headerBytes, initialBodyBytes) <- receiveHeaders BS.empty
+    let contentLength = httpContentLength headerBytes
+        remainingBodyBytes = max 0 (contentLength - BS.length initialBodyBytes)
+    drainBody remainingBodyBytes
+  where
+    receiveHeaders bufferedBytes =
+        case BS.breakSubstring "\r\n\r\n" bufferedBytes of
+            (headerBytes, separatorAndBody)
+                | not (BS.null separatorAndBody) ->
+                    pure (headerBytes, BS.drop 4 separatorAndBody)
+            _ -> do
+                nextBytes <- SocketBS.recv clientSocket 4096
+                if BS.null nextBytes
+                    then pure (bufferedBytes, BS.empty)
+                    else receiveHeaders (bufferedBytes <> nextBytes)
+
+    drainBody remainingBytes
+        | remainingBytes <= 0 =
+            pure ()
+        | otherwise = do
+            nextBytes <- SocketBS.recv clientSocket (min 4096 remainingBytes)
+            unless (BS.null nextBytes) (drainBody (remainingBytes - BS.length nextBytes))
+
+httpContentLength :: BS.ByteString -> Int
+httpContentLength headerBytes =
+    fromMaybe 0
+        $ viaNonEmpty
+            head
+            [ contentLength
+            | headerLine <- BC8.lines headerBytes
+            , Just rawContentLength <- [BC8.stripPrefix "Content-Length:" headerLine]
+            , Just contentLength <- [readMaybe (BC8.unpack (BC8.strip rawContentLength))]
+            ]
+
+geminiSseHttpResponse :: [Value] -> BS.ByteString
+geminiSseHttpResponse streamEvents =
+    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        <> foldMap geminiSseEvent streamEvents
+
+geminiSseEvent :: Value -> BS.ByteString
+geminiSseEvent eventValue =
+    "data: " <> LBS.toStrict (encode eventValue) <> "\n\n"
+
 recordRequest :: IOE :> es => IORef.IORef (Maybe Value) -> NativeMsgFormat -> Eff es ()
 recordRequest requestRef = \case
     NativeMsgOut requestBody ->
@@ -2005,8 +2296,16 @@ projectedAssistantMessage =
 nativeGeminiTextPayload :: Value
 nativeGeminiTextPayload =
     object
-        [ "type" .= ("text" :: Text)
-        , "text" .= ("native assistant text" :: Text)
+        [ "id" .= ("item-gemini" :: Text)
+        , "type" .= ("model_output" :: Text)
+        , "content"
+            .= ( [ object
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= ("native assistant text" :: Text)
+                    ]
+                 ]
+                    :: [Value]
+               )
         ]
 
 legacyGeminiTextPayload :: Value
@@ -2175,19 +2474,67 @@ responsesToolCallPayload itemId callId name arguments status =
         ]
 
 geminiResponse :: Text -> Text -> [Value] -> Value
-geminiResponse interactionId status outputs =
+geminiResponse interactionId status steps =
     object
         [ "id" .= interactionId
         , "status" .= status
-        , "outputs" .= outputs
+        , "steps" .= steps
+        ]
+
+geminiStreamCreatedEvent :: Value
+geminiStreamCreatedEvent =
+    object
+        [ "event_type" .= ("interaction.created" :: Text)
+        , "interaction"
+            .= object
+                [ "id" .= ("interaction-stream" :: Text)
+                , "status" .= ("in_progress" :: Text)
+                ]
+        ]
+
+geminiStepStopEvent :: Int -> Value
+geminiStepStopEvent stepIndex =
+    object
+        [ "event_type" .= ("step.stop" :: Text)
+        , "index" .= stepIndex
+        ]
+
+geminiArgumentsDeltaEvent :: Int -> Text -> Value
+geminiArgumentsDeltaEvent stepIndex argumentsFragment =
+    object
+        [ "event_type" .= ("step.delta" :: Text)
+        , "index" .= stepIndex
+        , "delta"
+            .= object
+                [ "type" .= ("arguments_delta" :: Text)
+                , "arguments" .= argumentsFragment
+                ]
+        ]
+
+geminiStreamTerminalEvent :: Text -> Text -> Value
+geminiStreamTerminalEvent eventType status =
+    object
+        [ "type" .= eventType
+        , "interaction"
+            .= object
+                [ "id" .= ("interaction-stream" :: Text)
+                , "status" .= status
+                ]
         ]
 
 geminiTextPayloadWithId :: Text -> Text -> Value
 geminiTextPayloadWithId itemId textValue =
     object
         [ "id" .= itemId
-        , "type" .= ("text" :: Text)
-        , "text" .= textValue
+        , "type" .= ("model_output" :: Text)
+        , "content"
+            .= ( [ object
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= textValue
+                    ]
+                 ]
+                    :: [Value]
+               )
         ]
 
 geminiFunctionCallPayload :: Text -> Text -> Value -> Value
@@ -2205,6 +2552,20 @@ geminiThoughtPayload itemId =
         [ "signature" .= itemId
         , "type" .= ("thought" :: Text)
         ]
+
+geminiProviderPayloads :: [HistoryItem] -> [Value]
+geminiProviderPayloads historyItems =
+    [ payload
+    | HistoryItem
+        { providerItem =
+            Just
+                ProviderItem
+                    { apiFamily = ProviderGeminiInteractions
+                    , payload
+                    }
+        } <-
+        historyItems
+    ]
 
 firstToolParameters :: Value -> Maybe Value
 firstToolParameters requestBody = do
@@ -2300,55 +2661,47 @@ sharedGeminiSystemInstruction =
 sharedGeminiHistoryRequest :: [Value]
 sharedGeminiHistoryRequest =
     [ object
-        [ "role" .= ("user" :: Text)
+        [ "type" .= ("user_input" :: Text)
         , "content"
             .= ( [ object
-                        [ "type" .= ("text" :: Text)
-                        , "text" .= ("hello" :: Text)
-                        ]
-                   ]
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= ("hello" :: Text)
+                    ]
+                 ]
                     :: [Value]
                )
         ]
     , object
-        [ "role" .= ("model" :: Text)
+        [ "type" .= ("model_output" :: Text)
         , "content"
             .= ( [ object
-                        [ "type" .= ("text" :: Text)
-                        , "text" .= ("partial " :: Text)
-                        ]
-                   , object
-                        [ "type" .= ("text" :: Text)
-                        , "text" .= ("answer" :: Text)
-                        ]
-                   , object
-                        [ "type" .= ("function_call" :: Text)
-                        , "id" .= ("tool-call-1" :: Text)
-                        , "name" .= ("lookup" :: Text)
-                        , "thought_signature" .= ("context_engineering_is_the_way_to_go" :: Text)
-                        , "arguments" .= object ["name" .= ("John Snow" :: Text)]
-                        ]
-                   ]
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= ("partial " :: Text)
+                    ]
+                 , object
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= ("answer" :: Text)
+                    ]
+                 ]
                     :: [Value]
                )
         ]
     , object
-        [ "role" .= ("user" :: Text)
-        , "content"
-                    .= ( [ object
-                        [ "type" .= ("function_result" :: Text)
-                        , "name" .= ("lookup" :: Text)
-                        , "call_id" .= ("tool-call-1" :: Text)
-                        , "result"
-                            .= ( [ object
-                                        [ "type" .= ("text" :: Text)
-                                        , "text" .= ("\"ok\"" :: Text)
-                                        ]
-                                   ]
-                                    :: [Value]
-                               )
-                        ]
-                   ]
+        [ "type" .= ("function_call" :: Text)
+        , "id" .= ("tool-call-1" :: Text)
+        , "name" .= ("lookup" :: Text)
+        , "arguments" .= object ["name" .= ("John Snow" :: Text)]
+        ]
+    , object
+        [ "type" .= ("function_result" :: Text)
+        , "name" .= ("lookup" :: Text)
+        , "call_id" .= ("tool-call-1" :: Text)
+        , "result"
+            .= ( [ object
+                    [ "type" .= ("text" :: Text)
+                    , "text" .= ("\"ok\"" :: Text)
+                    ]
+                 ]
                     :: [Value]
                )
         ]

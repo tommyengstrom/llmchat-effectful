@@ -23,11 +23,11 @@ import Rake.Providers.Gemini.Chat
     , runRakeGeminiChat
     )
 import Rake.Providers.OpenAI.Chat
-    ( OpenAIChatSettings (..)
-    , decodeOpenAIResponse
+    ( decodeOpenAIResponse
     , defaultOpenAIChatSettings
     , runRakeOpenAIChat
     )
+import Rake.Providers.OpenAI.Chat qualified as OpenAI
 import Rake.Providers.XAI.Chat
     ( XAIChatSettings (..)
     , defaultXAIChatSettings
@@ -397,20 +397,10 @@ spec = describe "Rake.Replay" $ do
                     . runErrorNoCallStackWith @ChatStorageError (error . show)
                     . runRakeStorageInMemory
                     $ do
-                        let OpenAIChatSettings
-                                { apiKey = defaultApiKey
-                                , model = defaultModel
-                                , organizationId = defaultOrganizationId
-                                , projectId = defaultProjectId
-                                } = defaultOpenAIChatSettings "test-api-key"
-                            settings =
-                                OpenAIChatSettings
-                                    { apiKey = defaultApiKey
-                                    , model = defaultModel
-                                    , baseUrl = Render.unreachableBaseUrl
-                                    , organizationId = defaultOrganizationId
-                                    , projectId = defaultProjectId
-                                    , requestLogger = \_ -> pure ()
+                        let settings =
+                                (defaultOpenAIChatSettings "test-api-key")
+                                    { OpenAI.baseUrl = Render.unreachableBaseUrl
+                                    , OpenAI.requestLogger = \_ -> pure ()
                                     }
                         convId <- createConversation
                         appendItems convId [user "show me a cat"]
@@ -457,20 +447,10 @@ spec = describe "Rake.Replay" $ do
                         . runErrorNoCallStackWith @ChatStorageError (error . show)
                         . runRakeStorageInMemory
                         $ do
-                            let OpenAIChatSettings
-                                    { apiKey = defaultApiKey
-                                    , model = defaultModel
-                                    , organizationId = defaultOrganizationId
-                                    , projectId = defaultProjectId
-                                    } = defaultOpenAIChatSettings "test-api-key"
-                                settings =
-                                    OpenAIChatSettings
-                                        { apiKey = defaultApiKey
-                                        , model = defaultModel
-                                        , baseUrl = Render.unreachableBaseUrl
-                                        , organizationId = defaultOrganizationId
-                                        , projectId = defaultProjectId
-                                        , requestLogger = Render.recordRequest requestRef
+                            let settings =
+                                    (defaultOpenAIChatSettings "test-api-key")
+                                        { OpenAI.baseUrl = Render.unreachableBaseUrl
+                                        , OpenAI.requestLogger = Render.recordRequest requestRef
                                         }
                             convId <- createConversation
                             appendItems convId [user "show me a cat"]
@@ -531,11 +511,7 @@ spec = describe "Rake.Replay" $ do
                 Render.lookupPath ["input"] requestBody
                     `shouldBe` Just
                         ( toJSON
-                            ( [ object
-                                    [ "role" .= ("user" :: Text)
-                                    , "content" .= ([requestPart] :: [Value])
-                                    ]
-                              ]
+                            ( [storedUserInputStep providerFamily requestPart]
                                 :: [Value]
                             )
                         )
@@ -551,11 +527,7 @@ spec = describe "Rake.Replay" $ do
                 Render.lookupPath ["input"] requestBody
                     `shouldBe` Just
                         ( toJSON
-                            ( [ object
-                                    [ "role" .= ("user" :: Text)
-                                    , "content" .= ([requestPart] :: [Value])
-                                    ]
-                              ]
+                            ( [storedUserInputStep providerFamily requestPart]
                                 :: [Value]
                             )
                         )
@@ -775,20 +747,10 @@ storedMediaRenderCases =
 captureStoredOpenAIRequestBody :: [MediaProviderReference] -> [HistoryItem] -> IO Value
 captureStoredOpenAIRequestBody mediaReferences history = do
     requestRef <- IORef.newIORef Nothing
-    let OpenAIChatSettings
-            { apiKey = defaultApiKey
-            , model = defaultModel
-            , organizationId = defaultOrganizationId
-            , projectId = defaultProjectId
-            } = defaultOpenAIChatSettings "test-api-key"
-        settings =
-            OpenAIChatSettings
-                { apiKey = defaultApiKey
-                , model = defaultModel
-                , baseUrl = Render.unreachableBaseUrl
-                , organizationId = defaultOrganizationId
-                , projectId = defaultProjectId
-                , requestLogger = Render.recordRequest requestRef
+    let settings =
+            (defaultOpenAIChatSettings "test-api-key")
+                { OpenAI.baseUrl = Render.unreachableBaseUrl
+                , OpenAI.requestLogger = Render.recordRequest requestRef
                 }
 
     result <-
@@ -885,6 +847,20 @@ captureStoredGeminiRequestBody mediaReferences history = do
 
     result `shouldSatisfy` isLeft
     Render.readRequest requestRef
+
+storedUserInputStep :: ProviderApiFamily -> Value -> Value
+storedUserInputStep providerFamily requestPart =
+    case providerFamily of
+        ProviderGeminiInteractions ->
+            object
+                [ "type" .= ("user_input" :: Text)
+                , "content" .= ([requestPart] :: [Value])
+                ]
+        _ ->
+            object
+                [ "role" .= ("user" :: Text)
+                , "content" .= ([requestPart] :: [Value])
+                ]
 
 imageRequestPart :: ProviderApiFamily -> Value
 imageRequestPart = \case

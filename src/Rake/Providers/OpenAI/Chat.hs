@@ -1,11 +1,12 @@
 module Rake.Providers.OpenAI.Chat
-    ( OpenAIChatSettings (..)
+    ( OpenAIReasoningEffort (..)
+    , OpenAIChatSettings (..)
     , defaultOpenAIChatSettings
     , decodeOpenAIResponse
     , runRakeOpenAIChat
     ) where
 
-import Data.Aeson (Value)
+import Data.Aeson (ToJSON (..), Value (..), object, (.=))
 import Effectful
 import Effectful.Error.Static
 import Rake.Effect
@@ -15,12 +16,32 @@ import Rake.Providers.Internal (defaultWarningLogger)
 import Rake.Types (ProviderRound)
 import Relude
 
+data OpenAIReasoningEffort
+    = OpenAIReasoningNone
+    | OpenAIReasoningLow
+    | OpenAIReasoningMedium
+    | OpenAIReasoningHigh
+    | OpenAIReasoningXHigh
+    | OpenAIReasoningMax
+    deriving stock (Show, Eq)
+
+instance ToJSON OpenAIReasoningEffort where
+    toJSON =
+        String . \case
+            OpenAIReasoningNone -> "none"
+            OpenAIReasoningLow -> "low"
+            OpenAIReasoningMedium -> "medium"
+            OpenAIReasoningHigh -> "high"
+            OpenAIReasoningXHigh -> "xhigh"
+            OpenAIReasoningMax -> "max"
+
 data OpenAIChatSettings es = OpenAIChatSettings
     { apiKey :: Text
     , model :: Text
     , baseUrl :: Text
     , organizationId :: Maybe Text
     , projectId :: Maybe Text
+    , reasoningEffort :: Maybe OpenAIReasoningEffort
     , requestLogger :: NativeMsgFormat -> Eff es ()
     }
 
@@ -32,6 +53,7 @@ defaultOpenAIChatSettings apiKey =
         , baseUrl = "https://api.openai.com"
         , organizationId = Nothing
         , projectId = Nothing
+        , reasoningEffort = Nothing
         , requestLogger = defaultWarningLogger "openai.chat"
         }
 
@@ -53,6 +75,7 @@ runRakeOpenAIChat OpenAIChatSettings{..} =
             , baseUrl
             , organizationId
             , projectId
+            , reasoningConfig = (\effort -> object ["effort" .= effort]) <$> reasoningEffort
             , requestLogger
             }
 

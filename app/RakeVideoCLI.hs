@@ -360,12 +360,14 @@ runGenVideo = \case
         case responseResult of
             Left err ->
                 pure (Left err)
-            Right GeminiVideoOperation{error = Just videoError} ->
-                pure (Left ("Gemini Veo video generation failed: " <> renderGeminiVideoError videoError))
-            Right GeminiVideoOperation{response = Just GeminiGenerateVideoResponse{generatedVideos = generatedVideo : _}} ->
-                saveGeminiGeneratedVideo settings maybeOutput promptText generatedVideo
-            Right GeminiVideoOperation{done} ->
-                pure (Left ("The provider did not return a completed Veo video operation. done=" <> show done))
+            Right operation@GeminiVideoOperation{response = Just videoResponse} ->
+                case videoResponse of
+                    GeminiGenerateVideoResponse{generatedVideos = generatedVideo : _} ->
+                        saveGeminiGeneratedVideo settings maybeOutput promptText generatedVideo
+                    GeminiGenerateVideoResponse{generatedVideos = []} ->
+                        reportGeminiVideoFailure operation
+            Right operation ->
+                reportGeminiVideoFailure operation
 
     saveGeminiGeneratedVideo settings maybeOutput promptText generatedVideo@GeminiGeneratedVideo{uri = maybeVideoUri} = do
         traverse_ (\videoUri -> putTextLn ("Provider video URI: " <> videoUri)) maybeVideoUri
@@ -377,6 +379,13 @@ runGenVideo = \case
                 outputPaths <- buildOutputPaths "video" maybeOutput promptText [".mp4"]
                 traverse_ (`writeBinaryFile` videoBytes) outputPaths
                 pure (Right outputPaths)
+
+    reportGeminiVideoFailure operation@GeminiVideoOperation{done} =
+        case geminiVideoOperationFailureMessage operation of
+            Just failureMessage ->
+                pure (Left ("Gemini Veo video generation failed: " <> failureMessage))
+            Nothing ->
+                pure (Left ("The provider did not return a completed Veo video operation. done=" <> show done))
 
     extendVideoFromEnd apiKey pollIntervalMilliseconds' maxPollAttempts' modelName promptText maybeOutput sourceVideo duration aspectRatio resolution = do
         ffmpegPathResult <- requireExecutable "ffmpeg"
@@ -1161,9 +1170,3 @@ renderVideoStatus = \case
         "failed"
     XAIVideoUnknown other ->
         other
-
-renderGeminiVideoError :: GeminiVideoError -> Text
-renderGeminiVideoError GeminiVideoError{code, message, status} =
-    T.intercalate
-        " "
-        (catMaybes [("code=" <>) . show <$> code, ("status=" <>) <$> status, message])

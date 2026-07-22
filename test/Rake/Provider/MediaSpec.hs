@@ -285,6 +285,124 @@ spec = describe "media providers" $ do
                                     }
                         }
 
+        it "parses RAI filtered video operation diagnostics" $ do
+            let filteredReason =
+                    "Sorry, we can't create videos with real people's names or likenesses. Please remove the celebrity reference and try again."
+                responseValue =
+                    object
+                        [ "name" .= ("models/veo-3.1-generate-preview/operations/op-1" :: Text)
+                        , "done" .= True
+                        , "response"
+                            .= object
+                                [ "generateVideoResponse"
+                                    .= object
+                                        [ "raiMediaFilteredCount" .= (1 :: Int)
+                                        , "raiMediaFilteredReasons" .= ([filteredReason] :: [Text])
+                                        ]
+                                ]
+                        ]
+
+            case fromJSON responseValue of
+                Error err ->
+                    expectationFailure err
+                Success operation@GeminiVideoOperation{done = True, response = Just videoResponse, error = Nothing} -> do
+                    case videoResponse of
+                        GeminiGenerateVideoResponse{generatedVideos = []} ->
+                            pure ()
+                        _ ->
+                            expectationFailure "Expected no generated videos"
+                    raiMediaFilteredCount videoResponse `shouldBe` Just 1
+                    raiMediaFilteredReasons videoResponse `shouldBe` [filteredReason]
+                    geminiVideoOperationFailureMessage operation `shouldBe` Just filteredReason
+                Success _ ->
+                    expectationFailure "Expected completed RAI filtered operation"
+
+        it "parses snake_case RAI filtered video diagnostics" $ do
+            let filteredReasons = ["filtered one", "filtered two"] :: [Text]
+                responseValue =
+                    object
+                        [ "generated_videos" .= ([] :: [Value])
+                        , "rai_media_filtered_count" .= (2 :: Int)
+                        , "rai_media_filtered_reasons" .= filteredReasons
+                        ]
+
+            case fromJSON responseValue of
+                Error err ->
+                    expectationFailure err
+                Success videoResponse -> do
+                    case videoResponse of
+                        GeminiGenerateVideoResponse{generatedVideos = []} ->
+                            pure ()
+                        _ ->
+                            expectationFailure "Expected no generated videos"
+                    raiMediaFilteredCount videoResponse `shouldBe` Just 2
+                    raiMediaFilteredReasons videoResponse `shouldBe` filteredReasons
+
+        it "preserves RAI filtered diagnostics in JSON" $ do
+            let filteredReasons = ["filtered one"] :: [Text]
+                responseValue =
+                    object
+                        [ "generatedVideos" .= ([] :: [Value])
+                        , "raiMediaFilteredCount" .= (1 :: Int)
+                        , "raiMediaFilteredReasons" .= filteredReasons
+                        ]
+
+            case fromJSON responseValue of
+                Error err ->
+                    expectationFailure err
+                Success (videoResponse :: GeminiGenerateVideoResponse) ->
+                    toJSON videoResponse `shouldBe` responseValue
+
+        it "summarizes Veo operation errors" $ do
+            let operation =
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = True
+                        , response = Nothing
+                        , error =
+                            Just
+                                GeminiVideoError
+                                    { code = Just 400
+                                    , message = Just "blocked"
+                                    , status = Just "FAILED_PRECONDITION"
+                                    }
+                        }
+
+            geminiVideoOperationFailureMessage operation
+                `shouldBe` Just "code=400 status=FAILED_PRECONDITION blocked"
+
+        it "summarizes completed Veo operations with no videos and no provider reason" $ do
+            let operation =
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = True
+                        , response = Just (GeminiGenerateVideoResponse [])
+                        , error = Nothing
+                        }
+
+            geminiVideoOperationFailureMessage operation
+                `shouldBe` Just "Gemini Veo video generation completed but did not return a generated video."
+
+        it "does not summarize Veo operations with a generated video" $ do
+            let operation =
+                    GeminiVideoOperation
+                        { name = GeminiVideoOperationName "models/veo-3.1-generate-preview/operations/op-1"
+                        , done = True
+                        , response =
+                            Just
+                                ( GeminiGenerateVideoResponse
+                                    [ GeminiGeneratedVideo
+                                        { uri = Just "https://example.com/video.mp4"
+                                        , mimeType = Just "video/mp4"
+                                        , videoBytes = Nothing
+                                        }
+                                    ]
+                                )
+                        , error = Nothing
+                        }
+
+            geminiVideoOperationFailureMessage operation `shouldBe` Nothing
+
     describe "request encoding" $ do
         it "encodes default OpenAI image requests for gpt-image-2" $ do
             toJSON (defaultOpenAIImageRequest "draw a lighthouse")

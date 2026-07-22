@@ -47,6 +47,7 @@ data ResponsesProviderConfig es = ResponsesProviderConfig
     , model :: Text
     , organizationId :: Maybe Text
     , projectId :: Maybe Text
+    , reasoningConfig :: Maybe Value
     , requestLogger :: NativeMsgFormat -> Eff es ()
     }
 
@@ -138,31 +139,32 @@ buildResponsesRequestBody
     -> SamplingOptions
     -> [HistoryItem]
     -> Eff es Value
-buildResponsesRequestBody ResponsesProviderConfig{providerTag, requestLogger, model} tools responseFormat samplingOptions history = do
+buildResponsesRequestBody ResponsesProviderConfig{providerTag, requestLogger, model, reasoningConfig} tools responseFormat samplingOptions history = do
     -- OpenAI and xAI share this Responses renderer. We collapse GenericSystem
     -- to the latest snapshot and send it once as the leading instruction for
     -- provider compatibility, instead of replaying historical system messages.
     let (maybeSystemSnapshot, chronologicalHistory) = splitRenderableResponsesHistory history
     leadingSystemInput <-
-        fmap concat $
-            traverse
+        fmap concat
+            $ traverse
                 (renderHistoryItemForResponses providerTag requestLogger)
                 (maybeToList maybeSystemSnapshot)
     chronologicalInput <-
-        fmap concat $
-            traverse
+        fmap concat
+            $ traverse
                 (renderHistoryItemForResponses providerTag requestLogger)
                 chronologicalHistory
     let input = leadingSystemInput <> chronologicalInput
-    pure $
-        object $
-            [ "model" .= model
-            , "input" .= input
-            , "store" .= False
-            ]
-                <> samplingFields
-                <> toolFields
-                <> responseFormatFields
+    pure
+        $ object
+        $ [ "model" .= model
+          , "input" .= input
+          , "store" .= False
+          ]
+        <> samplingFields
+        <> reasoningFields
+        <> toolFields
+        <> responseFormatFields
   where
     samplingFields =
         catMaybes
@@ -172,15 +174,23 @@ buildResponsesRequestBody ResponsesProviderConfig{providerTag, requestLogger, mo
 
     SamplingOptions{temperature, topP} = samplingOptions
 
+    reasoningFields =
+        case (providerTag, reasoningConfig) of
+            (ResponsesProviderOpenAI, Just configValue) ->
+                ["reasoning" .= configValue]
+            _ ->
+                []
+
     toolFields
         | null tools = []
         | otherwise = ["tools" .= fmap toolDeclarationToValue tools]
 
     responseFormatFields =
-        maybe [] (\formatValue -> ["text" .= object ["format" .= formatValue]]) $
-            responseFormatToValue responseFormat
+        maybe [] (\formatValue -> ["text" .= object ["format" .= formatValue]])
+            $ responseFormatToValue responseFormat
 
-buildResponsesStreamingRequest :: ResponsesProviderConfig es -> Value -> IO HttpClient.Request
+buildResponsesStreamingRequest
+    :: ResponsesProviderConfig es -> Value -> IO HttpClient.Request
 buildResponsesStreamingRequest ResponsesProviderConfig{apiKey, baseUrl, organizationId, projectId} requestBody = do
     request <- HttpClient.parseRequest (toString baseUrl <> "/v1/responses")
     pure

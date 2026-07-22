@@ -194,24 +194,32 @@ classifyGeminiPayload :: Value -> ([Text], GenericItem)
 classifyGeminiPayload = \case
     Object itemObject ->
         case lookupText "type" itemObject of
+            Just "model_output" ->
+                geminiModelOutputToGeneric itemObject
             Just "text" ->
                 case lookupText "text" itemObject of
                     Just text ->
                         ([], GenericMessage{role = GenericAssistant, parts = [PartText text]})
                     Nothing ->
-                        (["Dropped malformed Gemini text content during canonical projection"], GenericNonPortable)
+                        ( ["Dropped malformed Gemini text content during canonical projection"]
+                        , GenericNonPortable
+                        )
             Just "function_call" ->
                 case parseGeminiToolCall itemObject of
                     Just genericToolCall' ->
                         ([], GenericToolCall{toolCall = genericToolCall'})
                     Nothing ->
-                        (["Dropped malformed Gemini function_call content during canonical projection"], GenericNonPortable)
+                        ( ["Dropped malformed Gemini function_call content during canonical projection"]
+                        , GenericNonPortable
+                        )
             Just "function_result" ->
                 case parseGeminiToolResult itemObject of
                     Just genericToolResult' ->
                         ([], GenericToolResult{toolResult = genericToolResult'})
                     Nothing ->
-                        (["Dropped malformed Gemini function_result content during canonical projection"], GenericNonPortable)
+                        ( ["Dropped malformed Gemini function_result content during canonical projection"]
+                        , GenericNonPortable
+                        )
             Just "thought" ->
                 ([], GenericNonPortable)
             Just unsupportedType ->
@@ -224,6 +232,54 @@ classifyGeminiPayload = \case
                         (["Persisted malformed unused Gemini item"], GenericNonPortable)
     _ ->
         (["Persisted non-object unused Gemini item"], GenericNonPortable)
+
+geminiModelOutputToGeneric :: Object -> ([Text], GenericItem)
+geminiModelOutputToGeneric itemObject =
+    case extractGeminiModelOutputParts (KM.lookup "content" itemObject) of
+        (notes, []) ->
+            ( notes <> ["Persisted unused Gemini model_output item without supported content parts"]
+            , GenericNonPortable
+            )
+        (notes, parts) ->
+            (notes, GenericMessage{role = GenericAssistant, parts})
+
+extractGeminiModelOutputParts :: Maybe Value -> ([Text], [MessagePart])
+extractGeminiModelOutputParts = \case
+    Nothing ->
+        (["Gemini model_output item was missing content"], [])
+    Just (String text) ->
+        ([], [PartText text])
+    Just (Array contentParts) ->
+        foldMap geminiModelOutputPart (Vector.toList contentParts)
+    Just _ ->
+        (["Gemini model_output content was neither text nor an array"], [])
+
+geminiModelOutputPart :: Value -> ([Text], [MessagePart])
+geminiModelOutputPart = \case
+    Object partObject ->
+        case lookupText "type" partObject of
+            Just "text" ->
+                case lookupText "text" partObject of
+                    Just text ->
+                        ([], [PartText text])
+                    Nothing ->
+                        (["Dropped malformed Gemini text content during canonical projection"], [])
+            Just "refusal" ->
+                case lookupText "refusal" partObject <|> lookupText "text" partObject of
+                    Just text ->
+                        ([], [PartRefusal text])
+                    Nothing ->
+                        (["Dropped malformed Gemini refusal content during canonical projection"], [])
+            Just unsupportedType ->
+                (["Persisted unused Gemini model_output content type: " <> unsupportedType], [])
+            Nothing ->
+                case lookupText "text" partObject of
+                    Just text ->
+                        ([], [PartText text])
+                    Nothing ->
+                        (["Persisted malformed unused Gemini model_output content"], [])
+    _ ->
+        (["Persisted non-object unused Gemini model_output content"], [])
 
 classifyGeminiPayloads :: [Value] -> [(Value, [Text], GenericItem)]
 classifyGeminiPayloads =

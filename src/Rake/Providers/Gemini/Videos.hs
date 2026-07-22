@@ -1,3 +1,5 @@
+{-# LANGUAGE PatternSynonyms #-}
+
 module Rake.Providers.Gemini.Videos
     ( GeminiVideoSettings (..)
     , defaultGeminiVideoSettings
@@ -7,12 +9,15 @@ module Rake.Providers.Gemini.Videos
     , GeminiVideoOperationName (..)
     , GeminiVideoError (..)
     , GeminiGeneratedVideo (..)
-    , GeminiGenerateVideoResponse (..)
+    , GeminiGenerateVideoResponse (GeminiGenerateVideoResponse, generatedVideos)
+    , raiMediaFilteredCount
+    , raiMediaFilteredReasons
     , GeminiVideoOperation (..)
     , startGeminiVideo
     , getGeminiVideo
     , generateGeminiVideo
     , downloadGeminiVideo
+    , geminiVideoOperationFailureMessage
     ) where
 
 import Control.Concurrent (threadDelay)
@@ -177,10 +182,25 @@ instance ToJSON GeminiGeneratedVideo where
                 , ("videoBytes" .=) <$> videoBytes
                 ]
 
-newtype GeminiGenerateVideoResponse = GeminiGenerateVideoResponse
-    { generatedVideos :: [GeminiGeneratedVideo]
-    }
+data GeminiGenerateVideoResponse
+    = GeminiGenerateVideoResponseData [GeminiGeneratedVideo] (Maybe Int) [Text]
     deriving stock (Show, Eq, Generic)
+
+pattern GeminiGenerateVideoResponse :: [GeminiGeneratedVideo] -> GeminiGenerateVideoResponse
+pattern GeminiGenerateVideoResponse{generatedVideos} <- GeminiGenerateVideoResponseData generatedVideos _ _
+  where
+    GeminiGenerateVideoResponse generatedVideos =
+        GeminiGenerateVideoResponseData generatedVideos Nothing []
+
+{-# COMPLETE GeminiGenerateVideoResponse #-}
+
+raiMediaFilteredCount :: GeminiGenerateVideoResponse -> Maybe Int
+raiMediaFilteredCount (GeminiGenerateVideoResponseData _ count _) =
+    count
+
+raiMediaFilteredReasons :: GeminiGenerateVideoResponse -> [Text]
+raiMediaFilteredReasons (GeminiGenerateVideoResponseData _ _ reasons) =
+    reasons
 
 instance FromJSON GeminiGenerateVideoResponse where
     parseJSON value =
@@ -199,23 +219,36 @@ instance FromJSON GeminiGenerateVideoResponse where
                         generatedVideosSnake <- obj .:? "generated_videos"
                         generatedSamplesCamel <- obj .:? "generatedSamples"
                         generatedSamplesSnake <- obj .:? "generated_samples"
+                        raiMediaFilteredCountCamel <- obj .:? "raiMediaFilteredCount"
+                        raiMediaFilteredCountSnake <- obj .:? "rai_media_filtered_count"
+                        raiMediaFilteredReasonsCamel <- obj .:? "raiMediaFilteredReasons"
+                        raiMediaFilteredReasonsSnake <- obj .:? "rai_media_filtered_reasons"
                         pure
-                            GeminiGenerateVideoResponse
-                                { generatedVideos =
-                                    fromMaybe
-                                        []
-                                        ( firstPresent
-                                            [ generatedVideosCamel
-                                            , generatedVideosSnake
-                                            , generatedSamplesCamel
-                                            , generatedSamplesSnake
-                                            ]
-                                        )
-                                }
+                            ( GeminiGenerateVideoResponseData
+                                ( fromMaybe
+                                    []
+                                    ( firstPresent
+                                        [ generatedVideosCamel
+                                        , generatedVideosSnake
+                                        , generatedSamplesCamel
+                                        , generatedSamplesSnake
+                                        ]
+                                    )
+                                )
+                                (firstPresent [raiMediaFilteredCountCamel, raiMediaFilteredCountSnake])
+                                (fromMaybe [] (firstPresent [raiMediaFilteredReasonsCamel, raiMediaFilteredReasonsSnake]))
+                            )
 
 instance ToJSON GeminiGenerateVideoResponse where
-    toJSON GeminiGenerateVideoResponse{generatedVideos} =
-        object ["generatedVideos" .= generatedVideos]
+    toJSON response@GeminiGenerateVideoResponse{generatedVideos} =
+        object $
+            ["generatedVideos" .= generatedVideos]
+                <> catMaybes
+                    [ ("raiMediaFilteredCount" .=) <$> raiMediaFilteredCount response
+                    ]
+                <> [ "raiMediaFilteredReasons" .= raiMediaFilteredReasons response
+                   | not (null (raiMediaFilteredReasons response))
+                   ]
 
 data GeminiVideoOperation = GeminiVideoOperation
     { name :: GeminiVideoOperationName
@@ -248,6 +281,36 @@ instance ToJSON GeminiVideoOperation where
                     [ ("response" .=) <$> response
                     , ("error" .=) <$> maybeError
                     ]
+
+geminiVideoOperationFailureMessage :: GeminiVideoOperation -> Maybe Text
+geminiVideoOperationFailureMessage GeminiVideoOperation{error = Just videoError} =
+    Just (renderGeminiVideoError videoError)
+geminiVideoOperationFailureMessage GeminiVideoOperation{done, response = Just videoResponse@GeminiGenerateVideoResponse{generatedVideos}}
+    | not (null generatedVideos) =
+        Nothing
+    | not (null (raiMediaFilteredReasons videoResponse)) =
+        Just (T.intercalate "\n" (raiMediaFilteredReasons videoResponse))
+    | done =
+        Just completedWithoutVideoMessage
+    | otherwise =
+        Nothing
+geminiVideoOperationFailureMessage GeminiVideoOperation{done, response = Nothing}
+    | done =
+        Just completedWithoutVideoMessage
+    | otherwise =
+        Nothing
+
+renderGeminiVideoError :: GeminiVideoError -> Text
+renderGeminiVideoError GeminiVideoError{code, message, status} =
+    case catMaybes [("code=" <>) . show <$> code, ("status=" <>) <$> status, message] of
+        [] ->
+            "Provider returned a terminal error with no details."
+        parts ->
+            T.intercalate " " parts
+
+completedWithoutVideoMessage :: Text
+completedWithoutVideoMessage =
+    "Gemini Veo video generation completed but did not return a generated video."
 
 type GeminiVideosAPI =
     "v1beta"

@@ -8,6 +8,8 @@ and this project adheres to the
 
 ## Unreleased
 
+- Added typed OpenAI Responses reasoning-effort settings, omitted by default, with explicit support for `none`, `low`, `medium`, `high`, `xhigh`, and `max`.
+- Migrated Gemini Interactions chat requests, responses, and streams to the current typed-step schema while retaining legacy stored-response decoding.
 - Changed canonical conversation storage to an append-only agent log. Provider-native items now carry `ItemPending` or `ItemCompleted`, and unresolved tool calls or incomplete assistant output are persisted as ordinary history instead of being hidden in transient loop state.
 - Replaced `chatOutcomeFinalizedItems` with `chatOutcomeItems` as the low-level storage extractor for resumable `chatOutcome` flows.
 - Added embedded `HistoryItemId`s plus `ResetCheckpoint`-based recovery helpers for append-only replay, including `validResetCheckpoints`, `latestValidCheckpoint`, `resetToLatestValidCheckpoint`, `resetTo`, and `resetToStart`.
